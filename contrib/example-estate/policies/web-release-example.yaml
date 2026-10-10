@@ -1,0 +1,136 @@
+# FICTIONAL example: release 1.4.0 of the "shop" web app to web1.
+#
+# web1 is posture `frozen`, so every mutating step here is `break_glass: true`:
+# this file, reviewed and committed, is the only thing that lets vpsexec reach
+# it. Reads (P1, V1, V2) need no authorisation at all; they are listed so the
+# walker runs them in order and so the reviewer sees the whole release.
+#
+# The shop runs as a docker compose project in /srv/shop. The compose file
+# builds the image example/shop-web:latest from /srv/shop/app.
+#
+# Walk it (see contrib/runbook-walker/):
+#
+#   contrib/runbook-walker/walk.sh --runbook web-release-example --list
+#   contrib/runbook-walker/deploy.sh web-release-example --ttl 30m \
+#       --reason "shop 1.4.0 release"
+#
+# Content-addressed: step 4 pushes shop-1.4.0.tar.gz by its sha256, and step 5
+# re-checks that hash on the host immediately before unpacking it. Arming this
+# file authorises exactly those bytes. Rebuild the artifact and every hash
+# below must change, which invalidates any grant minted over the old file.
+#
+# Rollback: R1 then R2 (both `rollback: true`). The walker and `vpsexec grant
+# new` skip them unless asked: run them deliberately, e.g.
+#   contrib/runbook-walker/walk.sh --runbook web-release-example --only 10 \
+#       --reason "shop 1.4.0 rollback"
+#
+# Retire this file to policies/examples/superseded/ once the release is done.
+
+version: 1
+expires: "2026-12-31"
+shape: {steps: 11, hosts: [edge1, web1], break_glass: mixed}
+reason: >
+  shop 1.4.0 on web1 (fictional example estate). Replaces /srv/shop/app with the
+  1.4.0 build, rebuilds the image and recreates the web service. The previous
+  image is kept as example/shop-web:pre-1.4.0 and the replaced files as
+  /srv/releases/shop-pre-1.4.0.tar.gz.
+
+runbooks:
+  # 1
+  - hosts: [web1]
+    cmd: "docker ps --filter name=shop-web --format '{{.Names}} {{.Image}} {{.Status}}'"
+    where: host
+    break_glass: false
+    why: "P1: READ-ONLY precheck: the running shop container and its image.
+          Stop if shop-web is missing or not Up (healthy): fix that first, a
+          release onto a sick service hides the cause."
+
+  # 2
+  - hosts: [web1]
+    cmd: "docker tag example/shop-web:latest example/shop-web:pre-1.4.0"
+    where: host
+    verify: "docker inspect --format {{.Id}} example/shop-web:pre-1.4.0"
+    break_glass: true
+    why: "T1: rollback tag: keep the running image as example/shop-web:pre-1.4.0
+          (R1 restores it)"
+
+  # 3
+  - hosts: [web1]
+    cmd: "tar --create --gzip --file=/srv/releases/shop-pre-1.4.0.tar.gz --directory=/srv/shop app"
+    where: host
+    verify: "ls -l /srv/releases/shop-pre-1.4.0.tar.gz"
+    break_glass: true
+    why: "B1: back up the files this release replaces"
+
+  # 4
+  - hosts: [web1]
+    cmd: "vpscfg-push 0e6d3b6b60639e2ce61f2a19d5bc7a8def7243075b7d6d68d4a8642cafed2c2e shop-1.4.0.tar.gz"
+    where: host
+    break_glass: true
+    why: "S1: stage the 1.4.0 build at its content-addressed path
+          (/var/tmp/vpscfg-push/<sha256>/shop-1.4.0.tar.gz)"
+
+  # 5
+  - hosts: [web1]
+    cmd: "echo '0e6d3b6b60639e2ce61f2a19d5bc7a8def7243075b7d6d68d4a8642cafed2c2e  /var/tmp/vpscfg-push/0e6d3b6b60639e2ce61f2a19d5bc7a8def7243075b7d6d68d4a8642cafed2c2e/shop-1.4.0.tar.gz' | sha256sum --check --status && tar --extract --gzip --no-same-owner --file=/var/tmp/vpscfg-push/0e6d3b6b60639e2ce61f2a19d5bc7a8def7243075b7d6d68d4a8642cafed2c2e/shop-1.4.0.tar.gz --directory=/srv/shop"
+    where: host
+    verify: "echo '78b591400c56b7b67b8cb3b2b8a8e65e9093897f02ce0878e6b5405c68620fa7  /srv/shop/app/VERSION' | sha256sum --check --status"
+    break_glass: true
+    why: "U1: re-check the staged hash, then unpack over /srv/shop. The verify
+          fails unless app/VERSION is the 1.4.0 file."
+
+  # 6
+  - hosts: [web1]
+    cmd: "docker compose --project-directory /srv/shop build web"
+    where: host
+    timeout: 600
+    verify: "docker inspect --format {{.Id}} example/shop-web:latest"
+    break_glass: true
+    why: "C1: build example/shop-web:latest from the new files. The running
+          container is not touched yet."
+
+  # 7
+  - hosts: [web1]
+    cmd: "docker compose --project-directory /srv/shop up -d --no-build web"
+    where: host
+    timeout: 240
+    verify: "docker ps --filter name=shop-web --filter status=running --format {{.Names}} | grep -qx shop-web"
+    break_glass: true
+    why: "C2: recreate the web service on the new image"
+
+  # 8
+  - hosts: [web1]
+    cmd: "curl -qfsS --max-time 10 http://127.0.0.1:8080/healthz"
+    where: host
+    break_glass: false
+    why: "V1: READ: health from web1 itself. Stop if it does not answer: run
+          R1 and R2."
+
+  # 9
+  - hosts: [edge1]
+    cmd: "curl -qfsS --max-time 10 -H 'Host: www.example.com' http://192.0.2.10:8080/healthz"
+    where: host
+    break_glass: false
+    why: "V2: READ: health through the proxy's network path. Stop if it does
+          not answer: run R1 and R2."
+
+  # 10
+  - hosts: [web1]
+    cmd: "docker tag example/shop-web:pre-1.4.0 example/shop-web:latest"
+    where: host
+    verify: "docker inspect --format {{.Id}} example/shop-web:latest"
+    break_glass: true
+    rollback: true
+    why: "R1: point :latest back at the image T1 kept"
+
+  # 11
+  - hosts: [web1]
+    cmd: "docker compose --project-directory /srv/shop up -d --no-build --force-recreate web"
+    where: host
+    timeout: 240
+    verify: "curl -qfsS --max-time 10 http://127.0.0.1:8080/healthz"
+    break_glass: true
+    rollback: true
+    why: "R2: recreate the web service on the restored image. The 1.4.0 files
+          stay in /srv/shop/app; restore them from B1's tarball before the next
+          build if you are abandoning the release."

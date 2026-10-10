@@ -1,0 +1,303 @@
+# The gates that guard the gates.
+#
+# This repo's value is that its tests prove the REFUSALS: all-gates-green still
+# refuses, the three doors carry an identical floor, no combination of policy
+# file, runbook, --break-glass and valid approval reaches a deny-always pattern.
+# Until this workflow existed those tests were operator-run — the same mistake
+# the tool exists to prevent, one level up.
+#
+# Two deliberate choices:
+#   * A SKIPPED test fails the build. Six tests skip without PyYAML, so a CI
+#     that installed nothing would go green while every policy, override and
+#     runbook test quietly did not run. Silently green is worse than red.
+#     The ONE exception is a fixed list of macOS-only tests (xcrun shims, ACLs,
+#     the committed Mac shebang), and only on Linux — the macOS leg runs them
+#     and allows no skip at all, so every test runs somewhere, every build.
+#   * setup-python's interpreter is made pinnable (no group/world write) before
+#     anything runs. tools/pin-interpreter.sh refusing a writable interpreter
+#     is the control; the runner is fixed to meet it, never the other way.
+#   * The tripwires run again as their own job, by name, so a failure says
+#     WHICH invariant broke instead of "1 of 257 failed".
+#
+# Everything here runs on fixtures and the fictional contrib/example-estate,
+# so it is green on the tool alone. An estate that keeps its own governor and
+# pinning tests in the same repository adds its own workflow for them.
+
+name: gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: full suite (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor this code is written against; 3.12 catches anything
+        # a newer runtime tightens. Targets have a Debian 10 compatibility
+        # floor. macOS is where the operator runs the doors, and the only
+        # place the xcrun shim, ACL and committed-shebang tests can run at all.
+        include:
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: macos-latest, python: "3.12" }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: make the runner's interpreter pinnable
+        run: |
+          # Some toolcache Pythons unpack group-writable, and pin-interpreter
+          # (rightly) refuses an interpreter someone else could swap. Remove
+          # the shared write bits from the whole install, then prove the two
+          # paths the pin checks — the real binary and its directory — are clean.
+          py="$(python -c 'import os, sys; print(os.path.realpath(sys.executable))')"
+          sudo chmod -R go-w "$pythonLocation" "$(dirname "$py")"
+          shared="$(find "$py" "$(dirname "$py")" -prune \( -perm -020 -o -perm -002 \) -print)"
+          [ -z "$shared" ] || { echo "::error::still group/world-writable: $shared"; exit 1; }
+      - name: install dependencies
+        run: |
+          python -m pip install --quiet --require-hashes -r requirements.txt
+          # Into the interpreter's own site-packages, never the user site:
+          # the doors run under -I, which ignores the user site.
+          python -I -c 'import os, sys, yaml; p = os.path.realpath(yaml.__file__); assert p.startswith(os.path.realpath(sys.prefix) + os.sep), p'
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y rsync
+          else
+            # GNU stat/mv/sha256sum, as on a Linux target (RealRemoteScriptTest).
+            brew list coreutils >/dev/null 2>&1 || brew install coreutils
+            # An operator Mac has Homebrew's GNU sha256sum ahead of the BSD
+            # /sbin one (which has no --check --status); put only that first.
+            gnu="$RUNNER_TEMP/gnu-sha256sum"
+            mkdir -p "$gnu"
+            ln -sf "$(brew --prefix coreutils)/libexec/gnubin/sha256sum" "$gnu/sha256sum"
+            "$gnu/sha256sum" --version | grep -q GNU
+            echo "$gnu" >> "$GITHUB_PATH"
+            # The doors' committed shebang names Xcode's python3.9. On an
+            # operator Mac it is root-owned (the test pins that); the runner
+            # installs Xcode as itself. Give it the ownership it has in use.
+            target="$(head -n 1 vpsexec | sed -e 's/^#!//' -e 's/ -I$//')"
+            sudo chown root:wheel "$target"
+            sudo chmod go-w "$target"
+          fi
+      - name: run the suite, and refuse to pass on skips
+        run: |
+          # A file, not `python -`: multiprocessing's spawn re-imports
+          # __main__ by path, and <stdin> has none.
+          cat > "$RUNNER_TEMP/suite.py" <<'EOF'
+          import os, sys, unittest
+
+          # Skipped on Linux by design: they exercise macOS-only mechanisms and
+          # run (with no skip allowed) on the macOS leg. Exact test ids: a new
+          # skip anywhere else, or any skip on macOS, fails the build.
+          DARWIN_ONLY = {
+              "test_estate.HardeningUnit.test_real_macos_acl_is_detected",
+              "test_estate.HardeningUnit.test_real_macos_ancestor_acl",
+              "test_interpreter_isolation.IsolatedDoors.test_a_fake_developer_dir_cannot_run_any_door",
+              "test_interpreter_isolation.IsolatedDoors.test_darwin_shebang_is_a_real_root_owned_binary_not_a_shim",
+              "test_interpreter_isolation.PinInterpreter.test_darwin_shims_refuse",
+          }
+          allowed = DARWIN_ONLY if sys.platform != "darwin" else set()
+
+          if __name__ == "__main__":
+              sys.path.insert(0, os.getcwd())   # as `python -m unittest` does
+              suite = unittest.defaultTestLoader.discover("tests")
+              result = unittest.TextTestRunner(verbosity=2, stream=sys.stdout).run(suite)
+              if not result.wasSuccessful():
+                  sys.exit(1)
+              bad = [(t.id(), why) for t, why in result.skipped if t.id() not in allowed]
+              if bad:
+                  print("::error::tests were SKIPPED. A suite that silently skips its")
+                  print("::error::policy/override/runbook tests is worse than no CI.")
+                  for tid, why in bad:
+                      print("::error::skipped %s: %s" % (tid, why))
+                  sys.exit(1)
+              for t, why in result.skipped:
+                  print("allowed skip (runs on the macOS leg): %s: %s" % (t.id(), why))
+          EOF
+          python "$RUNNER_TEMP/suite.py"
+
+  tripwires:
+    name: named invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --quiet --require-hashes -r requirements.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y rsync
+
+      # Each invariant runs by name so a failure says WHICH one broke, not
+      # "1 of 257 failed". A selector matching ZERO tests is also a failure —
+      # otherwise renaming a class would silently retire its tripwire while CI
+      # stayed green, which is the exact failure mode this whole job exists for.
+      - name: run every named invariant
+        run: |
+          fail=0
+          tripwire() {
+            out=$(python -m unittest discover -s tests -k "$1" 2>&1)
+            ran=$(printf '%s' "$out" | sed -n 's/^Ran \([0-9]*\) test.*/\1/p')
+            if [ -z "$ran" ] || [ "$ran" = "0" ]; then
+              echo "::error::tripwire '$1' matched NO tests — renamed or deleted?"
+              fail=1
+              return
+            fi
+            if printf '%s' "$out" | grep -qE "skipped=[0-9]+"; then
+              echo "::error::tripwire '$1' skipped tests"
+              fail=1
+              return
+            fi
+            if printf '%s' "$out" | grep -q "^OK"; then
+              printf '  ok   %-34s %s test(s)  %s\n' "$1" "$ran" "$2"
+            else
+              echo "::error::INVARIANT BROKEN — $2"
+              printf '%s\n' "$out" | tail -40
+              fail=1
+            fi
+          }
+
+          tripwire FiringPinTest                  "the firing pin fires only its released sequence"
+          tripwire FloorSyncTest                  "all three doors carry an identical deny-always floor"
+          tripwire FloorIsAbsoluteTest            "nothing reaches the floor"
+          tripwire BreakGlassTest                 "elevation needs a runbook written before the incident"
+          tripwire AdHocOverrideCannotElevateTest "an ad-hoc override cannot elevate past a posture"
+          tripwire GovernorAliasTest              "an alias cannot launder a posture"
+          tripwire ReadHeadFlagTest               "a destructive flag is never a read"
+          tripwire SecretPathTest                 "credential paths are refused on every tier"
+          tripwire ExampleEstateTest              "the example estate loads; every check and verify is a read"
+          tripwire NoEnvironmentVariable          "no environment variable names an integration or a gate input"
+          tripwire PolicyTighteningTest           "the YAML layer can add rules, never remove them"
+          tripwire CommandSafetyTest              "read classification and shell-equivalent floor refusals"
+          tripwire DurableJournalTest             "concurrent, durable audit writes"
+          tripwire DeploymentSafetyTest           "partial transfer recovery and uncertain completion"
+          tripwire LockOwnershipTest              "only the owning operation releases a completed lock"
+          tripwire HealthDeadlineTest             "nonempty checks and bounded startup polling"
+          tripwire SyncLayoutTest                 "real rsync preserves nested paths and exclusions"
+          tripwire ReadOnlyWrapperTest            "outer doors agree on diagnostics and deny floor"
+
+          exit $fail
+
+  wrapper:
+    name: the doors refuse from a clean checkout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - name: make the runner's interpreter pinnable
+        run: |
+          py="$(python -c 'import os, sys; print(os.path.realpath(sys.executable))')"
+          sudo chmod -R go-w "$pythonLocation" "$(dirname "$py")"
+      - run: python -m pip install --quiet --require-hashes -r requirements.txt
+
+      # The install step every deployment does: tools/pin-interpreter.sh
+      # points the doors' shebangs at ONE absolute, real interpreter binary
+      # with -I (never `env python3`, which lets PATH pick it, and never a
+      # macOS /usr/bin shim, which lets DEVELOPER_DIR pick it). Here that is
+      # the interpreter holding the pinned dependencies.
+      - name: pin the doors' interpreter
+        run: |
+          py="$(python -c 'import os, sys; print(os.path.realpath(sys.executable))')"
+          tools/pin-interpreter.sh "$py"
+          for door in vpsexec vpscfg-control.py vpsrun; do
+            head -n 1 "$door" | grep -qxF "#!$py -I" \
+              || { echo "::error::$door is not pinned to $py"; head -n 1 "$door"; exit 1; }
+          done
+
+      # The doors import PyYAML from the interpreter's own site-packages:
+      # under -I there is no user site, PYTHONPATH or script directory.
+      - name: PyYAML is in the pinned interpreter's site-packages
+        run: |
+          python -I -c 'import os, sys, yaml; p = os.path.realpath(yaml.__file__); assert p.startswith(os.path.realpath(sys.prefix) + os.sep), p; print("yaml:", p)'
+
+      # The public repo ships no governor (D3): the doors run against the
+      # fictional example estate, through the one sanctioned redirect — a
+      # pinned estate.path in the tool checkout, owner/mode-checked. The copy
+      # lives under a fresh 0700 mktemp directory so every ancestor passes the
+      # estate's ownership walk. HOME only supplies the example ssh stanzas.
+      - name: lay out a tool copy pointed at contrib/example-estate
+        run: |
+          work="$(cd "$(mktemp -d)" && pwd -P)"
+          mkdir -m 700 "$work/tool" "$work/estate" "$work/home" "$work/home/.ssh"
+          cp -R vpscfg vpscfg-control.py vpsexec vpsrun "$work/tool/"
+          cp -R contrib/example-estate/. "$work/estate/"
+          cp contrib/example-estate/ssh_config.example "$work/home/.ssh/config"
+          # Release `deploy` in the copy, so the frozen-host step below is
+          # refused by posture, not by a verb the example never released.
+          python -I -c 'import json, sys; p = sys.argv[1]; d = json.load(open(p)); d["allowed_verbs"].append("deploy"); json.dump(d, open(p, "w"), indent=2)' "$work/estate/vpscfg-control.json"
+          chmod -R go-w "$work"
+          printf '%s\n' "$work/estate" > "$work/tool/estate.path"
+          chmod 600 "$work/tool/estate.path"
+          echo "WORK=$work" >> "$GITHUB_ENV"
+
+      # End-to-end through the real entry points, started by path, with no
+      # fleet reachable. These must REFUSE — if any of them starts
+      # succeeding, a door is open.
+      - name: the doors judge the pointed example governor
+        working-directory: ${{ env.WORK }}/tool
+        env:
+          HOME: ${{ env.WORK }}/home
+        run: |
+          out="$(./vpscfg-control.py status)"
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q "verified via wrapper token: True" \
+            || { echo "::error::the two doors did not judge one governor"; exit 1; }
+          tail -n 1 journal/control.jsonl | grep -q '"estate_source": "pointer"' \
+            || { echo "::error::the door did not read the pointed estate"; exit 1; }
+
+      - name: vpsexec refuses a floor pattern at the outer door
+        working-directory: ${{ env.WORK }}/tool
+        env:
+          HOME: ${{ env.WORK }}/home
+        run: |
+          if ./vpsexec web1 'docker volume prune -f' --run --reason ci 2>&1 | tee /dev/stderr | grep -q "REFUSED"; then
+            echo "ok: refused"
+          else
+            echo "::error::a deny-always pattern was NOT refused"; exit 1
+          fi
+
+      # The bypass form, deliberately: the package started without the outer
+      # door. -I keeps the runner's environment out; the checkout is put on
+      # sys.path by hand because -I drops the working directory.
+      - name: direct package invocation degrades to read-only
+        working-directory: ${{ env.WORK }}/tool
+        env:
+          HOME: ${{ env.WORK }}/home
+        run: |
+          if python -I -c 'import runpy, sys; sys.path.insert(0, "."); sys.argv = ["vpsexec", "edge1", "./x", "--run", "--reason", "ci"]; runpy.run_module("vpscfg.vpsexec", run_name="__main__")' 2>&1 | grep -q "control token"; then
+            echo "ok: refused without the wrapper token"
+          else
+            echo "::error::the package mutated without a wrapper token"; exit 1
+          fi
+
+      - name: vpscfg-control refuses a mutation on a frozen host
+        working-directory: ${{ env.WORK }}/tool
+        env:
+          HOME: ${{ env.WORK }}/home
+        run: |
+          if ./vpscfg-control.py web1 deploy shop --run 2>&1 | grep -q "REFUSED: host 'web1' posture is 'frozen'"; then
+            echo "ok: refused"
+          else
+            echo "::error::a frozen host accepted a mutation"; exit 1
+          fi
+
+      - name: introspection works without touching a host
+        working-directory: ${{ env.WORK }}/tool
+        env:
+          HOME: ${{ env.WORK }}/home
+        run: |
+          ./vpsexec groups
+          ./vpsexec checks
+          ./vpsexec runbooks

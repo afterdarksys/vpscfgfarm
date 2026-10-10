@@ -1,0 +1,4 @@
+# Exported files that are not UTF-8 text, by exact path. Only their names and
+# denylisted terms in their raw (and gunzipped) bytes are scanned, so list a
+# file here only after looking inside it.
+contrib/example-estate/artifacts/shop-1.4.0.tar.gz  # the example release artifact; fictional, checked by tests/test_contrib.py

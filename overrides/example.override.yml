@@ -1,0 +1,48 @@
+# An AD-HOC vpsexec authorisation file, passed with --override=<this file>.
+#
+# Same schema as a runbook in policies/, and the same rules. The difference is
+# provenance, and it matters:
+#
+#   policies/*.yaml   committed, reviewed, always in force. Where break_glass
+#                     runbooks belong — outage response should be a lookup.
+#   overrides/*.yml   ad-hoc, opt-in per invocation. For the thing you did not
+#                     foresee, on a host whose posture already allows it.
+#
+# An --override file may NOT carry break_glass: true. Reaching a frozen host is
+# exactly the decision that must not be improvised at 3am, so elevation comes
+# only from a committed runbook.
+#
+#   vpsexec edge1 'systemctl restart shop-proxy' \
+#       --override=overrides/example.override.yml \
+#       --run --reason "OPS-1421 shop-proxy upgrade window"
+
+version: 1
+
+# Required. An authorisation without an expiry is a permanent hole.
+expires: "2026-09-30"
+
+# Required. Why this file exists at all — the ticket, the window, the incident.
+reason: "shop-proxy 1.62 upgrade window — OPS-1421"
+
+allow:
+  # Matching is EXACT on the whitespace-collapsed command, for the listed hosts,
+  # for one placement. No globs, no prefixes, no regex.
+  - hosts: [edge1]
+    cmd: "systemctl restart shop-proxy"
+    where: host                 # "host" | "container" — never both
+    why: "service reload after the contracted sync lands"
+
+  # `where: container` authorises the command INSIDE containers only. An entry
+  # for the host does not silently authorise 40 containers, and vice versa.
+  - hosts: [edge1]
+    cmd: "nginx -s reload"
+    where: container
+    why: "pick up the new vhost without a full container restart"
+
+# Rejected as tampered if you try any of these — the floor is not reachable
+# from any file, committed or ad-hoc:
+#   docker volume prune / docker system prune / docker volume rm
+#   rm -rf /<anything>   (the floor: no rm -rf outside a contract's deploy_dir)
+#   DROP TABLE / DROP DATABASE / DROP SCHEMA / TRUNCATE
+#   mkfs / dd if= / kubectl delete ns / terraform destroy
+#   anything containing $( ) or backticks — substitution cannot be scanned

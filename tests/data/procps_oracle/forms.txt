@@ -1,0 +1,298 @@
+-ef
+aux
+auxww
+-eo pid,comm
+-eo pid,comm,args
+-eo pid,args
+-ef -u 1000
+-u 1000
+-p 1,2
+-p 1 -o pid,comm
+-e --forest
+-o user
+-eo user,pid
+-e -o cputime
+-e -o etimes
+-e -o label
+-o pid= -p 1
+-ef -ef
+aux ax
+-ef -o args
+-ef -o pid,args
+-e -f -o args
+-e -o args -f
+-el -o args
+-elf -o args
+-fe --format args
+-ef --format=pid,args
+aux -ef
+-ef aux
+axu -e -o args
+aux -e
+-e aux
+ax -e
+-e -p 0
+-e -p 99999999999
+-e -u 4294967295
+-e -u 99999999999
+-e -o x
+-e -ox
+-e --format=x
+-e - x
+-e -- x
+-eux
+-e -u x
+-ef -u ax
+-ef -ux
+-le -u wx
+-fe -u nobody
+-e -p x
+-ef -p ax
+-ef -C ax
+-aue
+-ue
+-u e
+axe
+eww
+-p 1 e
+-e -C nginx
+-ea
+-u 0
+-e -u 0
+-e -p 4194305
+-e -u 1000,
+-e -p 1,
+-e -o pid,
+-e -o ,pid
+-e -o ''
+-e -o pid=a=b
+-e -o pid -O pid
+-ef --forest
+-eF
+-ely
+-eLf
+-efww
+-ej
+-e -j
+-ejf
+-ef -o pid=a,ppid
+-eo pid,pcpu,pmem,comm --sort=-pcpu
+-e --sort pid
+axeww
+eww -p 1
+-o pid,environ
+--format=pid,env
+--format pid,env
+ef
+-u axe
+--user=e
+-p e
+-u nobody
+-C nginx
+-C nginx -o pid,comm
+--sort pid
+-e -o pid -u ax
+-u postgres
+-C sendmail
+--user=postgres
+-C postgres -o pid,user
+--format '{{.Names}}'
+-u 4294967294
+-u
+-C
+-p 1 -o args e
+auxeww
+axe -o args
+axeo pid,args
+e -p 1
+--format=pid,environ
+--sort=pid e
+-Ae
+-U postgres
+-aux
+-axe
+-fe
+-o e
+-oenviron
+-p 1 -o args
+-e --user ax
+-ef --user=ax
+-u Ue
+-u oe
+-u pe
+-u te
+--pid 1
+--pid e
+--sort=pid
+-A
+-A e
+-Cax
+-N
+-N e
+-e --
+-e --cols 100
+-e --foo v
+-e --format pid
+-e --no-headers
+-e --pid 1e3
+-e --x=v
+-e -C 1
+-e -C 1e
+-e -L
+-e -N
+-e -T
+-e -k pid
+-e -p 0x1e
+-e -p 1,e
+-e -p 1e3
+-e -w
+-e x
+-eL
+-eN ax
+-ew
+-fe -C nginx
+-o pid
+-ox
+-pax
+-uax
+x -e
+--format x
+--pid 1 -o args
+-H --forest
+-L -T
+-a
+-e --forest -o pid,args
+-e --headers
+-e -A
+-e -o cgroup
+-e -o pid -o args
+-e -o pid=
+-e -o pid=a,ppid
+-e -p 4194304
+-e -u 4294967294
+-efwwwwww
+-f -F
+-j -l
+-o ''
+-o ,pid
+-o pid -O pid
+-o pid,
+-o pid=
+-o pid=a=b
+-p 1 -f
+-u 1000 -o pid,args
+-wwwwww
+aux auxww
+-e -o %cpu
+-e -o %mem
+-e -o args
+-e -o class
+-e -o cls
+-e -o cmd
+-e -o comm
+-e -o command
+-e -o etime
+-e -o euser
+-e -o f
+-e -o flags
+-e -o gid
+-e -o group
+-e -o lstart
+-e -o lwp
+-e -o ni
+-e -o nice
+-e -o nlwp
+-e -o pcpu
+-e -o pgid
+-e -o pid
+-e -o pmem
+-e -o ppid
+-e -o pri
+-e -o psr
+-e -o rss
+-e -o rsz
+-e -o ruser
+-e -o s
+-e -o sid
+-e -o start
+-e -o stat
+-e -o state
+-e -o stime
+-e -o sz
+-e -o tid
+-e -o time
+-e -o tt
+-e -o tty
+-e -o uid
+-e -o user
+-e -o vsize
+-e -o vsz
+-e -o wchan
+-eT --forest
+-Te --forest
+-efT --forest
+-elT --forest
+-eHT
+-eHT -p 1
+-eHT -o args
+-eHT -o pid,args
+-eHT -O args
+-eHT --format args
+-eHT -p 1 -o args
+-ewT --forest
+-eTf --forest
+-eTl --forest
+-eTH
+-eTH -p 1
+-eTH -o args
+-eTH -o pid,args
+-eTH -O args
+-eTH --format args
+-eTH -p 1 -o args
+-eTw --forest
+-eTj --forest
+-ejT --forest
+-feT --forest
+-fTe --forest
+-leT --forest
+-lTe --forest
+-HeT
+-HeT -p 1
+-HeT -o args
+-HeT -o pid,args
+-HeT -O args
+-HeT --format args
+-HeT -p 1 -o args
+-HTe
+-HTe -p 1
+-HTe -o args
+-HTe -o pid,args
+-HTe -O args
+-HTe --format args
+-HTe -p 1 -o args
+-weT --forest
+-wTe --forest
+-Tef --forest
+-Tel --forest
+-TeH
+-TeH -p 1
+-TeH -o args
+-TeH -o pid,args
+-TeH -O args
+-TeH --format args
+-TeH -p 1 -o args
+-Tew --forest
+-Tej --forest
+-Tfe --forest
+-Tle --forest
+-THe
+-THe -p 1
+-THe -o args
+-THe -o pid,args
+-THe -O args
+-THe --format args
+-THe -p 1 -o args
+-Twe --forest
+-Tje --forest
+-jeT --forest
+-jTe --forest

@@ -1,0 +1,445 @@
+#!/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I
+"""vpsrun — a human runs a queued play: every step shown, one phrase typed.
+
+The agent writes a play (plays/*.yaml): an ordered list of vpsexec mutations
+with a reason. The human types `vpsrun` in a real terminal, reads every step's
+plan, types ONE phrase, and the steps run in order. The output lands in the
+terminal and in the journal, where the agent reads it with `vpsexec last`.
+Nothing is copied out of chat and nothing is pasted back in.
+
+vpsrun holds no authority. Each step goes through the real `vpsexec` door
+twice: once without --run to get its plan and plan-hash, then with
+`--run --approve=<that hash>`. A step whose plan is break-glass also gets
+`--approval-contract=FILE` (a grant from `vpsexec grant new`): --approve alone
+no longer approves break-glass, so without a contract covering every
+break-glass step the play refuses UP FRONT, before any step runs. Every gate (floor, secrets, posture, runbooks,
+break-glass, locks, journal) runs exactly as for a hand-typed command. The
+phrase replaces typing each step's own phrase; it does not replace any gate.
+
+A step whose command is a READ is not planned (the door runs a read the moment
+it is asked, plan mode included). It runs at its own position, after the
+phrase, as a plain read: no --run, no --approve, no contract, and the door's
+own output must say `tier    : read` or the play halts there.
+
+Threats:
+  - Protects against: a step changing between being shown and being run (the
+    plan-hash binds hosts, order, command, containers and override; a mismatch
+    refuses that step and halts the play); a play smuggling approval flags
+    (--run, --approve, --reason and --yes are refused in a step's flags; only
+    an allowlist passes); a read step running before approval or out of order
+    (read steps are never sent to the door in plan mode; they run in place
+    after the phrase), or a "read" step gaining authority (it is sent with no
+    --run, --approve or contract, may carry only placement/timeout flags, and
+    a door that does not report it as tier read halts the play — without
+    --run the door runs nothing that is not a read); partial runs
+    continuing blindly (first failure halts; later steps are listed as not run);
+    a play failing halfway for want of break-glass approval (a contract's
+    presence and its coverage of every break-glass step are checked before
+    the play phrase is asked for).
+  - Does NOT protect against: an agent that can already pass --approve itself.
+    The TTY requirement keeps vpsrun a human tool; the boundary is still the
+    door, not this file.
+"""
+import os
+import sys
+
+# Run isolated (-I): ignore every PYTHON* variable (PYTHONPATH, PYTHONHOME,
+# PYTHONUSERBASE, PYTHONSTARTUP...), the user site-packages and the script's
+# directory. Without it a sitecustomize.py on PYTHONPATH can patch
+# Path.read_bytes in BOTH doors, so both obey a forged governor and the token
+# still verifies (W4 review H1). The shebang names an ABSOLUTE interpreter with
+# -I (`env python3` would let PATH pick a fake python3 that drops -I; W4 R1),
+# so a door started by path is isolated from its first instruction. Public
+# installs set the shebang to their own interpreter's absolute path. This
+# re-exec only catches `python3 vpsrun`, which cannot be fully protected: a
+# hostile startup hook in THAT first interpreter has run before this line.
+# Callers must start the doors by path and deny the `python3 door` form.
+# The shebang names the REAL interpreter binary (tools/pin-interpreter.sh):
+# on macOS /usr/bin/python3 is an xcrun shim that honours DEVELOPER_DIR,
+# TOOLCHAINS and SDKROOT, so it lets the environment pick the interpreter too.
+# Every re-exec and child below uses _PYTHON, sys.executable resolved to its
+# real file, and refuses a shim rather than run through one.
+
+
+def _interpreter():
+    exe = os.path.realpath(sys.executable or "")
+    if not os.path.isabs(exe) or not os.path.isfile(exe) or (
+            sys.platform == "darwin" and os.path.dirname(exe) == "/usr/bin"):
+        sys.stderr.write("REFUSED: interpreter %r is not a real interpreter binary "
+                         "(macOS /usr/bin entries are xcrun shims that honour "
+                         "DEVELOPER_DIR); pin one with tools/pin-interpreter.sh\n"
+                         % (sys.executable,))
+        sys.exit(2)
+    return exe
+
+
+_PYTHON = _interpreter()
+
+if __name__ == "__main__" and not sys.flags.isolated:
+    os.execv(_PYTHON, [_PYTHON, "-I", os.path.realpath(__file__)] + sys.argv[1:])
+
+import hashlib
+import json
+import re
+import shlex
+import subprocess
+from pathlib import Path
+
+REPO = Path(os.path.realpath(__file__)).parent
+sys.path.insert(0, str(REPO))
+
+# Queued plays name estate hosts, so they live under the estate root
+# (vpscfg/estate.py: this checkout unless its pinned estate.path names another).
+from vpscfg import estate as _estate  # noqa: E402
+
+PLAY_DIR = _estate.root() / "plays"
+VPSEXEC = [_PYTHON, "-I", str(REPO / "vpsexec")]
+DIGEST_RE = re.compile(r"--approve=([0-9a-f]{64})\b")
+# render_plan() prints these; vpsrun reads the door's own resolution of each
+# step rather than re-deriving hosts or normalisation itself.
+BREAK_GLASS_RE = re.compile(r"^\s*BREAK-GLASS: \d+ of \d+ host", re.M)
+PLAN_HOSTS_RE = re.compile(r"^PLAN — \d+ hosts?: (.+)$", re.M)
+PLAN_CMD_RE = re.compile(r"^  command : (.*)$", re.M)
+# Flags a step may carry. Approval, --run and --reason belong to vpsrun alone.
+STEP_FLAGS = ("--override=", "--in=", "--in-match=", "--verify=", "--break-glass",
+              "--canary", "--canary=", "--timeout=", "--require-blackout")
+# A read step has nothing to elevate, verify, canary or override.
+READ_STEP_FLAGS = ("--in=", "--in-match=", "--timeout=")
+# The FIRST tier line is the door's plan; anything later is remote output.
+TIER_RE = re.compile(r"^  tier    : (.*)$", re.M)
+PLAY_KEYS = {"version", "reason", "steps", "precheck"}
+# Named read-only audits a play may demand before anything is planned. Each
+# runs through the real vpscfg door against every host the play touches;
+# a non-zero exit (any CRITICAL/HIGH finding) refuses the whole play.
+PRECHECKS = {"k3s": ["fleet", "k3s"], "firewall": ["fleet", "firewall"]}
+VPSCFG = [_PYTHON, "-I", str(REPO / "vpscfg-control.py")]
+# Any control character (C0, DEL, C1) in text shown to the approving human
+# could clear the screen or rewrite a plan already printed. Refused at load.
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+STEP_KEYS = {"hosts", "cmd", "why", "flags", "push", "sha256"}
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class Refused(Exception):
+    pass
+
+
+def _clean(where, value):
+    value = str(value)
+    if CONTROL_RE.search(value):
+        raise Refused("%s contains a control character %r — refused: it could "
+                      "redraw the terminal the approver is reading"
+                      % (where, CONTROL_RE.search(value).group(0)))
+    return value
+
+
+def printable(text):
+    """Plan text comes from the door, which echoes the command. Escape every
+    control character except newline before it reaches the approver's screen."""
+    return "".join(c if c == "\n" or not CONTROL_RE.match(c)
+                   else "\\x%02x" % ord(c) for c in text)
+
+
+def load_play(path):
+    import yaml
+    raw = Path(path).read_bytes()
+    doc = yaml.safe_load(raw)
+    if not isinstance(doc, dict) or doc.get("version") != 1:
+        raise Refused("%s: not a version-1 play" % path)
+    unknown = sorted(set(doc) - PLAY_KEYS)
+    if unknown:
+        raise Refused("%s: unknown key(s) %r" % (path, unknown))
+    reason = _clean("reason", doc.get("reason") or "").strip()
+    if not reason:
+        raise Refused("%s: a play needs a reason — it is journaled on every step" % path)
+    steps = doc.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise Refused("%s: steps must be a non-empty list" % path)
+    out = []
+    for n, s in enumerate(steps, 1):
+        if not isinstance(s, dict):
+            raise Refused("step %d is not a mapping" % n)
+        unknown = sorted(set(s) - STEP_KEYS)
+        if unknown:
+            raise Refused("step %d: unknown key(s) %r" % (n, unknown))
+        is_push = "push" in s
+        if is_push and ("cmd" in s or not SHA_RE.match(str(s.get("sha256", "")))):
+            raise Refused("step %d: a push step names push + sha256 (64 hex) and no cmd" % n)
+        if not is_push and "sha256" in s:
+            raise Refused("step %d: sha256 belongs to a push step" % n)
+        for key in ("hosts", "push" if is_push else "cmd", "why"):
+            if not str(s.get(key) or "").strip():
+                raise Refused("step %d: missing %r" % (n, key))
+            _clean("step %d %s" % (n, key), s[key])
+        flags = [_clean("step %d flag" % n, f) for f in (s.get("flags") or [])]
+        for f in flags:
+            if not any(f == allowed or (allowed.endswith("=") and f.startswith(allowed))
+                       for allowed in STEP_FLAGS):
+                raise Refused("step %d: flag %r is not allowed in a play (allowed: %s)"
+                              % (n, f, ", ".join(STEP_FLAGS)))
+        if is_push:
+            out.append({"hosts": str(s["hosts"]), "push": str(s["push"]),
+                        "sha256": str(s["sha256"]), "why": str(s["why"]), "flags": flags,
+                        "cmd": "push %s" % s["push"]})
+        else:
+            out.append({"hosts": str(s["hosts"]), "cmd": str(s["cmd"]),
+                        "why": str(s["why"]), "flags": flags})
+    precheck = doc.get("precheck") or []
+    if not isinstance(precheck, list) or any(p not in PRECHECKS for p in precheck):
+        raise Refused("%s: precheck must be a list drawn from %s" % (path, sorted(PRECHECKS)))
+    return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(),
+            "reason": reason, "steps": out, "precheck": list(precheck)}
+
+
+def read_steps(play, classify=None):
+    """Step numbers whose command is a read.
+
+    Plan mode RUNS a read, so a read step must never be planned: it runs in
+    place after the phrase, as a plain read (see run_play). Its flags are
+    limited to placement and timeout, because nothing else means anything for
+    a read and a read step must not carry anything that looks like authority."""
+    if classify is None:
+        from vpscfg import gates, vpsexec
+        classify = lambda c: vpsexec.classify(c, gates.DENY_ALWAYS_FLOOR)[0]  # noqa: E731
+    reads = set()
+    for n, s in enumerate(play["steps"], 1):
+        if "push" in s:
+            continue  # always a mutation; vpsexec checks the file and its hash
+        try:
+            tier = classify(s["cmd"])
+        except Exception as e:  # refused outright: say so now, not mid-play
+            raise Refused("step %d refused by the classifier: %s" % (n, e))
+        if tier == "read":
+            extra = [f for f in s["flags"] if not f.startswith(READ_STEP_FLAGS)]
+            if extra:
+                raise Refused("step %d (%s) is a read; a read step may carry only "
+                              "%s, not %s" % (n, s["cmd"], ", ".join(READ_STEP_FLAGS),
+                                              ", ".join(extra)))
+            reads.add(n)
+    return reads
+
+
+def read_tag(play, n, step):
+    """Stands in for a plan-hash in the play phrase: binds the read as shown."""
+    return hashlib.sha256(("read\0" + "\0".join(step_argv(play, n, step)))
+                          .encode("utf-8")).hexdigest()
+
+
+def step_reason(play, n, step):
+    return "%s — step %d: %s" % (play["reason"], n, step["why"])
+
+
+def step_argv(play, n, step):
+    """The same argv for planning and running; vpsexec wants --reason in both."""
+    head = ([step["hosts"], "push", step["push"], "--sha256", step["sha256"]]
+            if "push" in step else [step["hosts"], step["cmd"]])
+    return head + step["flags"] + ["--reason", step_reason(play, n, step)]
+
+
+def plan_all(play, run, reads=()):
+    """Plan every step through the real door. Returns [(plan_text, digest)].
+    A read step is NOT sent to the door here (it would run now)."""
+    plans = []
+    for n, s in enumerate(play["steps"], 1):
+        if n in reads:
+            plans.append(("READ — runs here, after approval, as a plain read (no "
+                          "--run, no approval, no contract):\n  vpsexec %s"
+                          % " ".join(shlex.quote(a) for a in step_argv(play, n, s)[:-2]),
+                          read_tag(play, n, s)))
+            continue
+        rc, out = run(step_argv(play, n, s))
+        found = DIGEST_RE.findall(out)
+        if rc != 0 or len(set(found)) != 1:
+            raise Refused("step %d did not produce a plan (rc=%s):\n%s" % (n, rc, out))
+        plans.append((out, found[0]))
+    return plans
+
+
+def phrase(play, digests=()):
+    """Step count, break-glass count, and 6 hex of the plans shown: typing it
+    approves THESE plans, not any play of the same length."""
+    bg = sum(1 for s in play["steps"] if "--break-glass" in s["flags"])
+    tag = hashlib.sha256("".join(digests).encode()).hexdigest()[:6] if digests else ""
+    return "PLAY:%d%s%s" % (len(play["steps"]), ":BREAK-GLASS:%d" % bg if bg else "",
+                            ":" + tag if tag else "")
+
+
+def run_prechecks(play, check):
+    """Every precheck must pass on every host the play touches, before any
+    step is planned. `check(argv) -> (rc, output)` runs vpscfg."""
+    hosts = []
+    for s in play["steps"]:
+        for h in s["hosts"].split(","):
+            if h and not h.startswith("@") and h not in hosts:
+                hosts.append(h)
+    for name in play.get("precheck", []):
+        rc, text = check(PRECHECKS[name] + hosts)
+        print(text.rstrip())
+        if rc != 0:
+            raise Refused("precheck %r failed on %s — nothing was planned or run. Fix what "
+                          "it reports, then re-run the play." % (name, ", ".join(hosts)))
+
+
+def contract_coverage(play, plans, contract, load_grant=None):
+    """Break-glass step numbers, after refusing anything a contract would not
+    cover. Runs before the play is approved, so a play never fails halfway on
+    a missing approval."""
+    bg = [n for n, (text, _) in enumerate(plans, 1) if BREAK_GLASS_RE.search(text)]
+    if not bg:
+        return bg
+    if contract is None:
+        raise Refused(
+            "step(s) %s are break-glass, and --approve alone no longer approves "
+            "break-glass. Mint a grant for that runbook (vpsexec grant new "
+            "<runbook> --ttl <ttl> --run), then re-run: vpsrun %s "
+            "--approval-contract=FILE. Nothing was run."
+            % (", ".join(map(str, bg)), play["path"]))
+    if load_grant is None:
+        from vpscfg import gates, vpsexecgrant
+
+        def load_grant(path):
+            try:
+                return vpsexecgrant.preflight(path)
+            except gates.Refused as r:
+                raise Refused(str(r))
+    grant = load_grant(contract)
+    covered = set((st["cmd"], st["where"]) for st in grant["steps"])
+    uncovered = []
+    for n in bg:
+        text, step = plans[n - 1][0], play["steps"][n - 1]
+        cmd = PLAN_CMD_RE.search(text)
+        hosts = PLAN_HOSTS_RE.search(text)
+        where = ("container" if any(f.startswith(("--in=", "--in-match="))
+                                    for f in step["flags"]) else "host")
+        if (not cmd or not hosts or (cmd.group(1), where) not in covered
+                or not set(h.strip() for h in hosts.group(1).split(","))
+                <= set(grant["hosts"])):
+            uncovered.append(n)
+    if uncovered:
+        raise Refused("approval contract %s does not cover break-glass step(s) %s "
+                      "(command, placement or hosts) — mint a grant that does. "
+                      "Nothing was run." % (contract, ", ".join(map(str, uncovered))))
+    return bg
+
+
+def run_play(play, run, prompt, stream, check=None, contract=None, load_grant=None):
+    if not (hasattr(stream, "isatty") and stream.isatty()):
+        raise Refused("vpsrun needs a real terminal. It is how a HUMAN approves a "
+                      "play; open a terminal (not `!`) and run it there.")
+    if play.get("precheck"):
+        run_prechecks(play, check or _vpscfg_run)
+    reads = read_steps(play)
+    plans = plan_all(play, run, reads)
+    bg_steps = contract_coverage(play, plans, contract, load_grant)
+    for n, (s, (text, digest)) in enumerate(zip(play["steps"], plans), 1):
+        print("=" * 72)
+        print("STEP %d of %d — %s" % (n, len(plans), s["why"]))
+        print(printable(text.rstrip()))
+    print("=" * 72)
+    print("play   : %s  (sha256 %s)" % (play["path"], play["sha256"][:16]))
+    print("reason : %s" % play["reason"])
+    if bg_steps:
+        print("contract: %s covers break-glass step(s) %s"
+              % (contract, ", ".join(map(str, bg_steps))))
+    want = phrase(play, [d for _, d in plans])
+    from vpscfg import vpsexecgrant
+    vpsexecgrant.flush_input(stream)  # stray keys must not answer the play prompt
+    if prompt("Type %s to run all %d step(s) in order, anything else aborts: "
+              % (want, len(plans))).strip() != want:
+        raise Refused("approval text did not match %r — nothing ran" % want)
+
+    from vpscfg import journal
+    journal.append("vpsexec", {
+        "event": "play_approved", "play": play["path"], "play_sha256": play["sha256"],
+        "reason": play["reason"], "steps": [d for _, d in plans],
+        "operator": os.environ.get("USER", "unknown")})
+    for n, (s, (_, digest)) in enumerate(zip(play["steps"], plans), 1):
+        print("")
+        print(">>> STEP %d of %d — %s" % (n, len(plans), s["why"]))
+        if n in reads:
+            # A plain read: the same argv a human would type, with no --run,
+            # --approve or contract. Without --run the door executes nothing
+            # that is not a read, so a step it judges otherwise ran nothing.
+            rc, out = run(step_argv(play, n, s))
+            print(printable(out.rstrip()))
+            tier = TIER_RE.search(out)
+            if rc == 0 and (tier is None or tier.group(1) != "read"):
+                print("\nPLAY HALTED at step %d: the door did not run it as a read "
+                      "(policy may classify it differently) — nothing ran for it. "
+                      "%d later step(s) NOT run." % (n, len(plans) - n))
+                return 2
+        else:
+            extra = ["--approval-contract=" + contract] if n in bg_steps else []
+            rc, out = run(step_argv(play, n, s) + ["--run", "--approve=" + digest] + extra)
+            print(printable(out.rstrip()))
+        if rc != 0:
+            rest = len(plans) - n
+            print("\nPLAY HALTED at step %d (rc=%s). %d later step(s) NOT run." % (n, rc, rest))
+            print("The agent can read what happened with: vpsexec last -n %d" % n)
+            return rc
+    print("\nPLAY COMPLETE — %d step(s). The agent reads it with: vpsexec last -n %d"
+          % (len(plans), len(plans)))
+    return 0
+
+
+def _vpscfg_run(argv):
+    r = subprocess.run(VPSCFG + argv, capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+
+def _subprocess_run(argv):
+    r = subprocess.run(VPSEXEC + argv, capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+
+def parse_argv(argv):
+    """`PLAY [--approval-contract[=]FILE]` -> (play path, absolute contract or None)."""
+    positional, contract, i = [], None, 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--approval-contract="):
+            contract = a.split("=", 1)[1]
+        elif a == "--approval-contract":
+            if i + 1 >= len(argv):
+                raise Refused("--approval-contract needs a file path")
+            contract = argv[i + 1]
+            i += 1
+        elif a.startswith("-"):
+            raise Refused("unknown flag %r" % a)
+        else:
+            positional.append(a)
+        i += 1
+    if len(positional) != 1:
+        raise Refused("usage: vpsrun PLAY.yaml [--approval-contract=FILE]")
+    if contract is not None:
+        if not contract.strip():
+            raise Refused("--approval-contract needs a file path")
+        contract = os.path.abspath(os.path.expanduser(contract))
+    return positional[0], contract
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        queued = sorted(PLAY_DIR.glob("*.yaml")) if PLAY_DIR.is_dir() else []
+        print(__doc__.split("\n\n")[0])
+        print("\n  vpsrun plays/NAME.yaml     show every step, type one phrase, run")
+        print("  vpsrun plays/NAME.yaml --approval-contract=FILE")
+        print("                             break-glass steps: a grant covering each one")
+        print("\nQueued plays:" if queued else "\nNo plays queued in plays/.")
+        for p in queued:
+            print("  %s" % p.relative_to(PLAY_DIR.parent))  # the estate root, not REPO
+        return 0
+    try:
+        path, contract = parse_argv(argv)
+        return run_play(load_play(path), _subprocess_run,
+                        lambda msg: input(msg), sys.stdin, contract=contract)
+    except Refused as r:
+        print("REFUSED: %s" % r, file=sys.stderr)
+        return 2
+    except (KeyboardInterrupt, EOFError):
+        print("\naborted — nothing further ran", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

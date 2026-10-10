@@ -1,0 +1,39 @@
+# Named read plays for the FICTIONAL example estate: `vpsexec check <name>`.
+#
+# A check grants nothing. Its command must classify as a read, which vpsexec
+# enforces when it runs. The repo's own policies/checks.yaml has a fuller set
+# (services, sockets, disk, containers); this file shows the shape, including
+# a typed parameter.
+
+version: 1
+reason: "Read plays for the example estate"
+
+checks:
+  failed:
+    cmd: "systemctl list-units --type=service --state=failed --no-legend --no-pager"
+    hosts: "@all"
+    compare: true
+    why: "What is broken right now. Healthy hosts group together; a host with
+          failures stands out."
+
+  disk:
+    cmd: "df -h -x tmpfs -x devtmpfs -x overlay"
+    hosts: "@all"
+    compare: false
+    why: "Free space per filesystem. Hosts legitimately differ, so no compare."
+
+  shop-health:
+    cmd: "curl -qfsS --max-time 10 http://127.0.0.1:@@port@@/healthz"
+    hosts: "@web"
+    compare: true
+    params:
+      port:
+        re: "^[0-9]{2,5}$"
+        default: "8080"
+        why: "local port the shop container publishes"
+    why: "The shop's own health endpoint, asked from the host it runs on.
+          curl -f exits non-zero on an HTTP error, so a sick host fails the
+          check instead of printing an error page. The leading -q is required:
+          without it curl reads ~/.curlrc, and vpsexec will not call that a
+          read. Usage:
+          vpsexec check shop-health port=8080"

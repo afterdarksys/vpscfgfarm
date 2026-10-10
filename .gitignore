@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+
+# The local hash-chained journal: per-operator runtime state, never committed.
+journal/
+.venv-ansible/
+
+# Agent tooling state (notepads, session state, logs). `.omc/skills/` is the
+# deliberate exception: project-scoped skills are meant to be committed.
+.omc/*
+!.omc/skills/
+
+# Encrypted credential escrow bundles — encrypted or not, secrets stay out of git.
+escrow/
+
+# queued vpsrun plays: one-off intent, never policy
+plays/*.yaml
+
+# local run wrappers for queued plays and one-off releases: same one-off
+# intent as plays/*.yaml
+t.sh
+/*deploy.sh
+
+# Per-checkout pointer to a separate estate root (vpscfg/estate.py). Local
+# operator choice, never committed: a pointer in git would move every clone.
+/estate.path
+
+# Estate-specific ignores (deploy artifacts) live next to what they ignore,
+# e.g. deploy/.gitignore, so this file stays about the tool.

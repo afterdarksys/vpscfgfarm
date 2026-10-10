@@ -1,0 +1,28 @@
+# Host groups for the FICTIONAL example estate.
+#
+# Groups grant nothing. They name host sets so an operator types `@web`
+# instead of a comma list. Every member must have a posture in
+# vpscfg-control.json and be reachable through ~/.ssh/config (or be declared
+# alias_of a reachable host), both checked when the file loads.
+#
+# A file with only groups (no runbooks) needs no `expires`: it grants nothing,
+# so it cannot go stale in a dangerous way.
+#
+# `@all` is built in and reserved.
+
+version: 1
+reason: "Host groups for the example estate (web1, db1, edge1)"
+
+groups:
+  web:    [web1]
+  db:     [db1]
+  edge:   [edge1]
+
+  # Hosts running containers.
+  docker: [web1, edge1]
+
+  # The request path for www.example.com, front to back.
+  shop:   [edge1, web1, db1]
+
+  # Where it is safe to be wrong first.
+  test:   [edge1]

@@ -1,0 +1,299 @@
+ps from procps-ng 4.0.2
+ok       ps -ef
+ok       ps aux
+ok       ps auxww
+ok       ps -eo pid,comm
+ok       ps -eo pid,comm,args
+ok       ps -eo pid,args
+ok       ps -ef -u 1000
+err(1)   ps -u 1000
+ok       ps -p 1,2
+ok       ps -p 1 -o pid,comm
+ok       ps -e --forest
+ok       ps -o user
+ok       ps -eo user,pid
+ok       ps -e -o cputime
+ok       ps -e -o etimes
+ok       ps -e -o label
+ok       ps -o pid= -p 1
+ok       ps -ef -ef
+ok       ps aux ax
+LEAK     ps -ef -o args
+LEAK     ps -ef -o pid,args
+LEAK     ps -e -f -o args
+LEAK     ps -e -o args -f
+err(1)   ps -el -o args
+err(1)   ps -elf -o args
+LEAK     ps -fe --format args
+LEAK     ps -ef --format=pid,args
+err(1)   ps aux -ef
+err(1)   ps -ef aux
+err(1)   ps axu -e -o args
+ok       ps aux -e
+ok       ps -e aux
+ok       ps ax -e
+err(1)   ps -e -p 0
+err(1)   ps -e -p 99999999999
+err(1)   ps -e -u 4294967295
+err(1)   ps -e -u 99999999999
+err(1)   ps -e -o x
+err(1)   ps -e -ox
+err(1)   ps -e --format=x
+err(1)   ps -e - x
+err(1)   ps -e -- x
+LEAK     ps -eux
+err(1)   ps -e -u x
+err(1)   ps -ef -u ax
+LEAK     ps -ef -ux
+err(1)   ps -le -u wx
+ok       ps -fe -u nobody
+err(1)   ps -e -p x
+err(1)   ps -ef -p ax
+ok       ps -ef -C ax
+LEAK     ps -aue
+LEAK     ps -ue
+err(1)   ps -u e
+LEAK     ps axe
+LEAK     ps eww
+LEAK     ps -p 1 e
+ok       ps -e -C nginx
+ok       ps -ea
+ok       ps -u 0
+ok       ps -e -u 0
+ok       ps -e -p 4194305
+err(1)   ps -e -u 1000,
+err(1)   ps -e -p 1,
+ok       ps -e -o pid,
+err(1)   ps -e -o ,pid
+err(1)   ps -e -o ''
+ok       ps -e -o pid=a=b
+err(1)   ps -e -o pid -O pid
+ok       ps -ef --forest
+ok       ps -eF
+ok       ps -ely
+ok       ps -eLf
+ok       ps -efww
+ok       ps -ej
+ok       ps -e -j
+ok       ps -ejf
+ok       ps -ef -o pid=a,ppid
+ok       ps -eo pid,pcpu,pmem,comm --sort=-pcpu
+ok       ps -e --sort pid
+LEAK     ps axeww
+LEAK     ps eww -p 1
+ok       ps -o pid,environ
+err(1)   ps --format=pid,env
+err(1)   ps --format pid,env
+LEAK     ps ef
+err(1)   ps -u axe
+err(1)   ps --user=e
+err(1)   ps -p e
+err(1)   ps -u nobody
+err(1)   ps -C nginx
+err(1)   ps -C nginx -o pid,comm
+ok       ps --sort pid
+err(1)   ps -e -o pid -u ax
+err(1)   ps -u postgres
+err(1)   ps -C sendmail
+err(1)   ps --user=postgres
+err(1)   ps -C postgres -o pid,user
+err(1)   ps --format '{{.Names}}'
+err(1)   ps -u 4294967294
+ok       ps -u
+err(1)   ps -C
+LEAK     ps -p 1 -o args e
+LEAK     ps auxeww
+LEAK     ps axe -o args
+LEAK     ps axeo pid,args
+LEAK     ps e -p 1
+ok       ps --format=pid,environ
+LEAK     ps --sort=pid e
+ok       ps -Ae
+err(1)   ps -U postgres
+ok       ps -aux
+LEAK     ps -axe
+ok       ps -fe
+err(1)   ps -o e
+ok       ps -oenviron
+ok       ps -p 1 -o args
+err(1)   ps -e --user ax
+err(1)   ps -ef --user=ax
+err(1)   ps -u Ue
+err(1)   ps -u oe
+err(1)   ps -u pe
+err(1)   ps -u te
+ok       ps --pid 1
+err(1)   ps --pid e
+ok       ps --sort=pid
+ok       ps -A
+LEAK     ps -A e
+err(1)   ps -Cax
+err(1)   ps -N
+err(1)   ps -N e
+err(1)   ps -e --
+ok       ps -e --cols 100
+err(1)   ps -e --foo v
+ok       ps -e --format pid
+ok       ps -e --no-headers
+err(1)   ps -e --pid 1e3
+err(1)   ps -e --x=v
+ok       ps -e -C 1
+ok       ps -e -C 1e
+ok       ps -e -L
+err(1)   ps -e -N
+ok       ps -e -T
+LEAK     ps -e -k pid
+ok       ps -e -p 0x1e
+err(1)   ps -e -p 1,e
+err(1)   ps -e -p 1e3
+ok       ps -e -w
+ok       ps -e x
+ok       ps -eL
+err(1)   ps -eN ax
+ok       ps -ew
+ok       ps -fe -C nginx
+ok       ps -o pid
+err(1)   ps -ox
+err(1)   ps -pax
+ok       ps -uax
+ok       ps x -e
+err(1)   ps --format x
+ok       ps --pid 1 -o args
+ok       ps -H --forest
+err(1)   ps -L -T
+ok       ps -a
+ok       ps -e --forest -o pid,args
+ok       ps -e --headers
+ok       ps -e -A
+ok       ps -e -o cgroup
+ok       ps -e -o pid -o args
+ok       ps -e -o pid=
+ok       ps -e -o pid=a,ppid
+ok       ps -e -p 4194304
+ok       ps -e -u 4294967294
+ok       ps -efwwwwww
+ok       ps -f -F
+ok       ps -j -l
+err(1)   ps -o ''
+err(1)   ps -o ,pid
+err(1)   ps -o pid -O pid
+ok       ps -o pid,
+ok       ps -o pid=
+ok       ps -o pid=a=b
+ok       ps -p 1 -f
+err(1)   ps -u 1000 -o pid,args
+ok       ps -wwwwww
+ok       ps aux auxww
+ok       ps -e -o %cpu
+ok       ps -e -o %mem
+ok       ps -e -o args
+ok       ps -e -o class
+ok       ps -e -o cls
+ok       ps -e -o cmd
+ok       ps -e -o comm
+ok       ps -e -o command
+ok       ps -e -o etime
+ok       ps -e -o euser
+ok       ps -e -o f
+ok       ps -e -o flags
+ok       ps -e -o gid
+ok       ps -e -o group
+ok       ps -e -o lstart
+ok       ps -e -o lwp
+ok       ps -e -o ni
+ok       ps -e -o nice
+ok       ps -e -o nlwp
+ok       ps -e -o pcpu
+ok       ps -e -o pgid
+ok       ps -e -o pid
+ok       ps -e -o pmem
+ok       ps -e -o ppid
+ok       ps -e -o pri
+ok       ps -e -o psr
+ok       ps -e -o rss
+ok       ps -e -o rsz
+ok       ps -e -o ruser
+ok       ps -e -o s
+ok       ps -e -o sid
+ok       ps -e -o start
+ok       ps -e -o stat
+ok       ps -e -o state
+ok       ps -e -o stime
+ok       ps -e -o sz
+ok       ps -e -o tid
+ok       ps -e -o time
+ok       ps -e -o tt
+ok       ps -e -o tty
+ok       ps -e -o uid
+ok       ps -e -o user
+ok       ps -e -o vsize
+ok       ps -e -o vsz
+ok       ps -e -o wchan
+LEAK     ps -eT --forest
+LEAK     ps -Te --forest
+LEAK     ps -efT --forest
+LEAK     ps -elT --forest
+LEAK     ps -eHT
+LEAK     ps -eHT -p 1
+LEAK     ps -eHT -o args
+LEAK     ps -eHT -o pid,args
+LEAK     ps -eHT -O args
+LEAK     ps -eHT --format args
+LEAK     ps -eHT -p 1 -o args
+LEAK     ps -ewT --forest
+LEAK     ps -eTf --forest
+LEAK     ps -eTl --forest
+LEAK     ps -eTH
+LEAK     ps -eTH -p 1
+LEAK     ps -eTH -o args
+LEAK     ps -eTH -o pid,args
+LEAK     ps -eTH -O args
+LEAK     ps -eTH --format args
+LEAK     ps -eTH -p 1 -o args
+LEAK     ps -eTw --forest
+LEAK     ps -eTj --forest
+LEAK     ps -ejT --forest
+LEAK     ps -feT --forest
+LEAK     ps -fTe --forest
+LEAK     ps -leT --forest
+LEAK     ps -lTe --forest
+LEAK     ps -HeT
+LEAK     ps -HeT -p 1
+LEAK     ps -HeT -o args
+LEAK     ps -HeT -o pid,args
+LEAK     ps -HeT -O args
+LEAK     ps -HeT --format args
+LEAK     ps -HeT -p 1 -o args
+LEAK     ps -HTe
+LEAK     ps -HTe -p 1
+LEAK     ps -HTe -o args
+LEAK     ps -HTe -o pid,args
+LEAK     ps -HTe -O args
+LEAK     ps -HTe --format args
+LEAK     ps -HTe -p 1 -o args
+LEAK     ps -weT --forest
+LEAK     ps -wTe --forest
+LEAK     ps -Tef --forest
+LEAK     ps -Tel --forest
+LEAK     ps -TeH
+LEAK     ps -TeH -p 1
+LEAK     ps -TeH -o args
+LEAK     ps -TeH -o pid,args
+LEAK     ps -TeH -O args
+LEAK     ps -TeH --format args
+LEAK     ps -TeH -p 1 -o args
+LEAK     ps -Tew --forest
+LEAK     ps -Tej --forest
+LEAK     ps -Tfe --forest
+LEAK     ps -Tle --forest
+LEAK     ps -THe
+LEAK     ps -THe -p 1
+LEAK     ps -THe -o args
+LEAK     ps -THe -o pid,args
+LEAK     ps -THe -O args
+LEAK     ps -THe --format args
+LEAK     ps -THe -p 1 -o args
+LEAK     ps -Twe --forest
+LEAK     ps -Tje --forest
+LEAK     ps -jeT --forest
+LEAK     ps -jTe --forest

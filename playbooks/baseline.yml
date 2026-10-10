@@ -1,0 +1,26 @@
+# Baseline read: invariants every fleet host must hold. Runs ONLY through
+# `vpscfg <host> ansible baseline --show` (check mode; the driver never
+# builds an argv without --check in v0).
+- name: fleet baseline
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: /opt exists (deployment root)
+      ansible.builtin.stat:
+        path: /opt
+      register: opt_dir
+
+    - name: assert /opt is a directory
+      ansible.builtin.assert:
+        that: opt_dir.stat.isdir | default(false)
+        fail_msg: "/opt missing — deployment root gone"
+        quiet: true
+
+    - name: assert root filesystem has headroom (>2GiB free)
+      ansible.builtin.assert:
+        that: item.size_available > 2147483648
+        fail_msg: "root fs under 2GiB free on {{ inventory_hostname }}"
+        quiet: true
+      loop: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | list }}"
+      loop_control:
+        label: "{{ item.mount }} {{ (item.size_available / 1073741824) | round(1) }}GiB free"

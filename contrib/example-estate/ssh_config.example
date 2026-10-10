@@ -1,0 +1,27 @@
+# FICTIONAL example. Merge these stanzas into ~/.ssh/config.
+#
+# vpsexec reads ~/.ssh/config directly and does not follow Include lines, so
+# the stanzas have to be in that file itself. Every host in the governor and in
+# a policy group must be a `Host` alias here, or (like web1.example.internal)
+# be declared `alias_of` one in vpscfg-control.json.
+#
+# Addresses are from the documentation ranges (RFC 5737). The key path is a
+# placeholder: point it at your own key.
+
+Host web1
+    HostName 192.0.2.10
+    User root
+    IdentityFile ~/.ssh/id_ed25519_example
+    IdentitiesOnly yes
+
+Host db1
+    HostName 192.0.2.20
+    User root
+    IdentityFile ~/.ssh/id_ed25519_example
+    IdentitiesOnly yes
+
+Host edge1
+    HostName 198.51.100.5
+    User root
+    IdentityFile ~/.ssh/id_ed25519_example
+    IdentitiesOnly yes

@@ -1,0 +1,89 @@
+# What the PUBLIC vpscfgfarm repository is made of. Read by
+# tools/export-public.py. Default-deny: a tracked file not selected here is
+# never exported. `dir/` = everything under it, `*` stays in one segment,
+# `**` crosses segments, `!` excludes, the last matching line wins.
+#
+# Classification and reasoning live with the private estate (its split design
+# doc). A file listed here that still names the estate is sanitising backlog:
+# the exporter's scan refuses to commit until it is fixed or excepted by its
+# exact exception key.
+
+# --- the doors and the package
+vpscfg-control.py
+vpsexec
+vpsrun
+vpscfg/
+requirements.txt
+
+# --- CI and repo hygiene
+.github/workflows/gates.yml
+!.github/workflows/estate.yml
+.gitignore
+
+# --- license and project policy
+LICENSE
+NOTICE
+SECURITY.md
+CONTRIBUTING.md
+
+# --- the example estate and the runbook walker (fictional, RFC 5737)
+contrib/
+
+# --- docs about the TOOL (estate snapshots, runbooks and reviews stay private)
+README.md
+docs/README.md
+docs/DESIGN.md
+docs/HOWTO.md
+docs/K3S-APPLY.md
+docs/MAPFILE.md
+docs/NO-PASTE.md
+docs/PREFLIGHT.md
+docs/RECOVERY.md
+docs/REPAIR-PROTOCOL.md
+docs/SECURITY-TOOLING.md
+docs/STABILITY.md
+docs/VPSEXEC.md
+policies/README.md
+plays/README.md
+overrides/example.override.yml
+playbooks/baseline.yml
+
+# --- the exporter itself (its estate-specific denylist and exceptions stay private)
+tools/export-public.py
+tools/public-allowlist.txt
+tools/public-binary-allowlist.txt
+
+# --- install and maintenance tools
+tools/pin-interpreter.sh
+tools/procps-oracle.sh
+tools/fleetwatch-cron.sh
+tools/install-fleetwatch.sh
+
+# --- generators (generalised: they write into the configured estate).
+# Estate-only tools live under tools/estate/, which is never selected.
+tools/gen_skeletons.py
+tools/gen_firewall_rollout.py
+tools/firewall_rollout_header.txt
+tools/traefik_verify.py
+
+# --- tests (incl. tests/data/procps_oracle/). Estate-pinning tests move with
+# the estate (see the split doc); tests/estate/ is where they live meanwhile.
+tests/
+!tests/estate/
+
+# --- never, whatever is added above (last match wins, so these stay last)
+!estate.path
+!vpscfg-control.json
+!CLAUDE.md
+!TODO
+!tools/public-denylist.txt
+!tools/public-scan-exceptions.txt
+!policies/*.yaml
+!policies/examples/
+!overrides/*.yaml   # example.override.yml is .yml and stays selected
+!plays/*.yaml
+!contracts/
+!deploy/
+!inventory/
+!estate/
+!tools/estate/

@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "comment": "FICTIONAL example governor for contrib/. Three machines: web1 serves the shop and has no failover (frozen), db1 holds the database (lockdown), edge1 is the reverse proxy and the designated test host. Copy over the repo's vpscfg-control.json, then replace the hosts with your own. deny_always must contain at least the compiled-in floor; removing an entry refuses everything.",
+  "mode": "test",
+  "mutation_enabled": true,
+  "allowed_verbs": [
+    "show",
+    "details",
+    "containers",
+    "services",
+    "overlays",
+    "drift",
+    "verify",
+    "fleet",
+    "plan",
+    "status",
+    "help",
+    "exec",
+    "journal",
+    "logs",
+    "sql",
+    "secret-put",
+    "drill"
+  ],
+  "scopes": {
+    "unlocked": [],
+    "tested": [],
+    "graduation_rule": "A scope enters 'unlocked' only after it appears in 'tested' with result=pass. Progression is container -> pod -> service -> host, one scope at a time. Each unlock is one edit, one commit, one scope."
+  },
+  "hosts": {
+    "web1": {
+      "posture": "frozen",
+      "reason": "serves www.example.com; the only web host, no failover. Mutations only through a committed break_glass runbook"
+    },
+    "web1.example.internal": {
+      "posture": "frozen",
+      "reason": "internal FQDN of web1, the same machine. Postures must match the canonical host",
+      "alias_of": "web1"
+    },
+    "db1": {
+      "posture": "lockdown",
+      "reason": "primary database; reads only unless a committed break_glass runbook names the command"
+    },
+    "edge1": {
+      "posture": "test",
+      "reason": "reverse proxy in front of web1; designated test host, where it is safe to be wrong first"
+    }
+  },
+  "deny_always": [
+    "volume prune",
+    "system prune",
+    "image prune",
+    "network prune",
+    "builder prune",
+    "container prune",
+    "volume rm",
+    "compose down -v",
+    "compose down --volumes",
+    "down -v",
+    "down --volumes",
+    "DROP TABLE",
+    "DROP DATABASE",
+    "DROP SCHEMA",
+    "DROP ROLE",
+    "TRUNCATE",
+    "DELETE FROM",
+    "dropdb",
+    "dropuser",
+    "rm -rf /",
+    "kubectl delete ns",
+    "kubectl delete namespace",
+    "mkfs",
+    "dd if=",
+    "shred",
+    "terraform destroy"
+  ],
+  "limits": {
+    "max_scopes_per_run": 1,
+    "require_plan_ack": true,
+    "ssh_connect_timeout_sec": 8,
+    "command_timeout_sec": 120,
+    "max_parallel_hosts": 5
+  },
+  "unlock_log": []
+}
