@@ -18,8 +18,9 @@ run it again.
 READ-ONLY END TO END. Remote commands are fixed templates (validated paths
 shell-quoted, nothing from the operator), scanned against the deny floor
 before they leave; local commands are an allowlist (rsync only with
---dry-run, git only log/show, ansible-playbook only with --check). The only
-write is the local journal.
+--dry-run, git only log/show, ansible-playbook only with --check, badfarm
+only as `iac scan --format json` of a local path). The only write is the
+local journal.
 
 Threats:
   - Protects against: deploying onto a service that is already failing (the
@@ -30,13 +31,16 @@ Threats:
     a plan executed long after it was checked, or a different plan executed
     under an old GO (plan hash + freshness window, re-checked under the host
     lock); contract-supplied commands (named checks from a fixed allowlist
-    only, validated at contract load).
+    only, validated at contract load); IaC with known outage/lockout/exposure
+    risk (badfarm's static scan of the repo and playbooks; blocks only when
+    preflight.iac is required, and a scanner that cannot answer never passes).
   - Does NOT protect against: anything a probe cannot see. A GO is not a
     guarantee: there is no staging, ansible check mode SKIPS command/shell
     tasks, `compose config` validates syntax not behaviour, the baseline is
     only as strong as the contract's verify block, and live state can change
     between the preflight and the run (the window bounds it; the executor's
-    own live outage gate re-checks under lock). The journal is local: an
+    own live outage gate re-checks under lock). The IaC scan is static and
+    only as good as badfarm's rules and the badfarm the environment finds. The journal is local: an
     actor with write access to it can forge a GO record — the hash chain
     raises the bar, it does not remove it.
 """
@@ -47,9 +51,10 @@ import math
 import re
 import shlex
 import subprocess
+from pathlib import Path
 
-from . import (backupverify, blackout, drift, fingerprint, journal, k3sapply, lint,
-               outage, playbook, ports as ports_mod, probe, secretmask, syncplan)
+from . import (backupverify, blackout, drift, fingerprint, iacgate, journal, k3sapply,
+               lint, outage, playbook, ports as ports_mod, probe, secretmask, syncplan)
 from . import verify as verify_mod
 from .control import Guard
 from .gates import DENY_ALWAYS_FLOOR, Refused, assert_not_frozen, deny_scan
@@ -60,8 +65,8 @@ EXIT_CODES = {GO: 0, GO_WARN: 1, NO_GO: 2}
 STATUSES = ("pass", "warn", "fail", "skip", "error")
 FRESHNESS_SECONDS = 30 * 60
 CLOCK_SKEW_SECONDS = 5
-DEFAULTS = {"min_free_gb": 2, "min_free_mem_mb": 256, "drift": "fail"}
-PREFLIGHT_KEYS = frozenset(["min_free_gb", "min_free_mem_mb", "drift", "checks"])
+DEFAULTS = {"min_free_gb": 2, "min_free_mem_mb": 256, "drift": "fail", "iac": "advisory"}
+PREFLIGHT_KEYS = frozenset(["min_free_gb", "min_free_mem_mb", "drift", "iac", "checks"])
 # The ONLY deployability checks a contract may name. Each maps to a fixed,
 # read-only remote command built below — a contract never supplies a command.
 NAMED_CHECKS = frozenset(["compose_config", "nginx_test"])
@@ -97,6 +102,8 @@ def validate_contract_block(contract):
             _number(pf["min_free_mem_mb"], "min_free_mem_mb", 0, 10000000)
         if "drift" in pf and pf["drift"] not in ("fail", "warn"):
             raise Refused("preflight.drift must be 'fail' or 'warn'")
+        if "iac" in pf and (not isinstance(pf["iac"], str) or pf["iac"] not in iacgate.MODES):
+            raise Refused("preflight.iac must be 'off', 'advisory' or 'required'")
         checks = pf.get("checks", {})
         if not isinstance(checks, dict):
             raise Refused("preflight.checks must be a mapping of named checks")
@@ -232,6 +239,19 @@ class _Ctx(object):
 
     def local(self, argv, timeout=300):
         tool = argv[0].rsplit("/", 1)[-1]
+        if tool == "badfarm" or argv[1:3] == ["iac", "scan"]:
+            # argv[0] must be EXACTLY the located badfarm, regardless of its
+            # basename — a basename of "badfarm" proves nothing (an attacker
+            # can name anything "badfarm"); only an exact match to
+            # iacgate.locate() (an absolute, resolved, executable path) is
+            # accepted.
+            if argv[0] != iacgate.locate():
+                raise Refused("preflight local command %r is not the located badfarm" % tool)
+            _assert_iac_scan_argv(argv)
+            self.sent.append(("local", list(argv)))
+            # Production reads the report through the capped reader.
+            call = iacgate.run_capped if self._local is _default_local else self._local
+            return call(argv, timeout=timeout)
         if tool == "rsync" and "--dry-run" not in argv:
             raise Refused("preflight rsync without --dry-run — refusing")
         if tool == "ansible-playbook" and "--check" not in argv:
@@ -240,6 +260,20 @@ class _Ctx(object):
             raise Refused("preflight local command %r is not allowlisted" % tool)
         self.sent.append(("local", list(argv)))
         return self._local(argv, timeout=timeout)
+
+
+def _assert_iac_scan_argv(argv):
+    """badfarm only as `iac scan --format json --fail-on L -- /abs/dir`: a
+    local tree, never --repo/--ref (no clone), never another subcommand."""
+    opts = argv[1:-1]
+    if "--repo" in opts or "--ref" in opts or any(
+            a.startswith(("--repo=", "--ref=")) for a in opts):
+        raise Refused("preflight badfarm with --repo/--ref — local source trees only")
+    if len(argv) != 9 or argv[1:5] != ["iac", "scan", "--format", "json"] \
+            or argv[5] != "--fail-on" or argv[6] not in iacgate.FAIL_ON_LEVELS \
+            or argv[7] != "--" or not argv[8].startswith("/"):
+        raise Refused("preflight badfarm is allowlisted only as "
+                      "`iac scan --format json --fail-on LEVEL -- /abs/dir`")
 
 
 def _clip(text):
@@ -604,6 +638,44 @@ def _check_ansible(ctx):
         name, rc, "; ".join(recap) or (err or out).strip()[-300:], blind)
 
 
+_RANK = {"pass": 0, "skip": 0, "warn": 1, "fail": 2}
+
+
+def _check_iac(ctx, cfg, iac_scan=None):
+    """badfarm's static IaC scan of the contract repo (and playbooks/ when
+    the contract names a playbook). Blocks only under preflight.iac: required;
+    a scan that could not answer is a warn (advisory) or fail (required)."""
+    mode = cfg["iac"]
+    if mode == "off":
+        return "skip", "preflight.iac is off"
+    refused = "fail" if mode == "required" else "warn"
+    try:
+        exe = iacgate.locate()
+    except Refused as r:
+        return refused, "IaC gate not evaluated: %s" % r
+    if exe is None:
+        if mode == "required":
+            return "fail", "badfarm not installed; preflight.iac is required"
+        return "skip", "badfarm not installed; IaC gate not evaluated"
+    if iac_scan is None:
+        def iac_scan(path):
+            return iacgate.scan(path, runner=lambda argv, timeout=300: ctx.local(argv, timeout=timeout))
+    paths = [("repo", Path(ctx.contract["repo"]).expanduser().resolve())]
+    if ctx.contract.get("playbook"):
+        paths.append(("playbooks", playbook.PLAYBOOK_DIR))
+    worst, parts, scans = "pass", [], []
+    for label, path in paths:
+        try:
+            status, evidence, data = iacgate.classify(iac_scan(path), mode)
+        except Refused as r:
+            status, evidence, data = refused, "scan refused: %s" % r, None
+        if _RANK[status] > _RANK[worst]:
+            worst = status
+        parts.append("%s: %s" % (label, evidence))
+        scans.append({"path": label, "status": status, "result": data})
+    return worst, "[%s] %s" % (mode, "; ".join(parts)), {"mode": mode, "scans": scans}
+
+
 # ---- orchestration -----------------------------------------------------
 
 def _guarded(name, fn):
@@ -637,7 +709,7 @@ def verdict(checks):
 def run(contract, host, guard, raw_text, planned, host_contracts=None,
         allow_unhealthy=False, aliases=(), ssh=None, local=None, checks=None,
         backup_verifier=None, blackout_runner=None, fingerprint_report=None,
-        remote_runner=None, git_md5s=None, now=None):
+        remote_runner=None, git_md5s=None, iac_scan=None, now=None):
     """Run every check and return the report dict (not yet journaled).
     Keyword transports are TEST injection points; the checks and their
     read-only guards are the same either way."""
@@ -686,6 +758,7 @@ def run(contract, host, guard, raw_text, planned, host_contracts=None,
         results.append(_guarded("deployability:" + name,
                                 lambda name=name, spec=spec: _check_named(ctx, name, spec)))
     results.append(_guarded("ansible", lambda: _check_ansible(ctx)))
+    results.append(_guarded("iac", lambda: _check_iac(ctx, cfg, iac_scan)))
     v = verdict(results)
     return {
         "host": host, "service": contract["service"], "plan_hash": phash,

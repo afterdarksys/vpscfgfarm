@@ -27,7 +27,9 @@ the baseline `data` (the individual verify results).
 **Read-only end to end.** Remote commands are fixed templates, and validated
 paths are shell-quoted. Every command is deny-scanned against the floor
 before it is sent. Local commands are allowlisted in code: `rsync` only with
-`--dry-run` and `ansible-playbook` only with `--check`. The `git log/show`
+`--dry-run`, `ansible-playbook` only with `--check`, and `badfarm` only as
+`iac scan --format json --fail-on LEVEL -- /abs/dir` (never `--repo`/`--ref`).
+The `git log/show`
 history lookup reads the object store only. The one write is the local
 journal record. The outer door already classifies `deploy` without `--run`
 as a read. `--preflight` combined with `--run` is refused.
@@ -84,6 +86,7 @@ preflight bound into a single-use approval digest (REPAIR-PROTOCOL.md).
 | `blackout` | — (never) | window status unknown (the tool is unavailable) | anything; windows inform and never grant |
 | `deployability:compose_config` | `docker compose -f <deploy_dir>/<file> config -q` fails on the host | — | runtime behaviour; it validates syntax and interpolation only, against the host's **current** compose file, *before* the sync |
 | `deployability:nginx_test` | `nginx -t` (or `docker exec <container> nginx -t`) fails | — | that the new config is valid, since it tests what is on the host now. Host-level `nginx -t` may create a missing log or pid file; prefer the `{container: …}` form |
+| `iac` | `preflight.iac: required` and badfarm reports `block`, is not installed, or cannot answer (exit 2, timeout, non-JSON, schema mismatch, output over 8 MiB) | `block` under `advisory`; `warn` or `incomplete` in either mode; a scan that cannot answer under `advisory` | runtime behaviour or risk badfarm has no rule for: the scan is static. `skip` when `off`, or `advisory` with badfarm absent |
 | `ansible` | `ansible-playbook --check --diff` exits non-zero; **any YAML under `playbooks/` uses a construct that runs even under `--check`** (`check_mode: false`, `always_run`, `local_action`, `delegate_to`, `pipe`). In that case ansible is not run at all | — | **Check mode skips `command`/`shell` tasks** and cannot predict tasks that depend on earlier changes. A clean check is necessary, not sufficient. `skip` when there is no `playbook:` |
 
 Any check that raises a transport or parse error becomes `error`, and the
@@ -115,6 +118,7 @@ preflight:                 # optional; every key optional
   min_free_gb: 2           # default 2   — "/" and deploy_dir's filesystem
   min_free_mem_mb: 256     # default 256 — MemAvailable
   drift: fail              # fail (default) | warn — unexplained live divergence
+  iac: advisory            # off | advisory (default) | required — badfarm IaC scan
   checks:                  # NAMED checks from a fixed allowlist, never commands
     compose_config: true   #   or {file: docker-compose.prod.yml} (relpath under deploy_dir)
     nginx_test: true       #   or {container: edge-nginx}
@@ -132,6 +136,62 @@ amount to a command. Two examples that refuse the contract:
 preflight: {checks: {shell: "curl … | sh"}}               # refused: not in the allowlist
 preflight: {checks: {compose_config: "docker compose up"}} # refused: a string is a command
 ```
+
+## The IaC gate: `preflight.iac`
+
+The `iac` check runs `badfarm iac scan` (a separately installed tool) on the
+contract's `repo` and, when the contract names a `playbook:`, on `playbooks/`.
+It reads local trees only. badfarm is found as `$VPSCFG_BADFARM`, which must be
+an absolute path to an executable regular file (anything else refuses, with no
+PATH fallback), or else as `badfarm` on PATH — a PATH hit is held to the same
+bar: it is refused, not silently treated as absent, if it resolves to a
+relative path (PATH containing `.` or an empty entry can hand back `./badfarm`
+picked up from the very repo being scanned) or to anything that is not,
+once resolved, an executable regular file. The worst result across the
+scanned paths wins.
+
+Wherever `badfarm` runs as a local command (preflight's own allowlisted
+invocation, not just `fleet iac`), `argv[0]` must be **exactly** the path
+`locate()` returned — an absolute, resolved path. A file merely named
+`badfarm` elsewhere on disk, or a different build at a different path, is
+refused regardless of its basename.
+
+| `preflight.iac` | badfarm absent | `pass` | `warn` / `incomplete` | `block` | cannot answer |
+|---|---|---|---|---|---|
+| `off` | skip | skip | skip | skip | skip |
+| `advisory` (default) | skip | pass | warn | warn | warn |
+| `required` | **fail** | pass | warn | **fail** | **fail** |
+
+A `pass` with one or more in-source suppressions (`# badfarm:ignore`) is
+surfaced as `warn`, in every mode: an author-controlled suppression is not
+the same as a scan that found nothing, and should never read as a silent,
+unqualified pass.
+
+The reported verdict is not trusted blindly. Before it is used, vpscfg
+recomputes the verdict itself from the report's `findings`, `coverage` and
+the `--fail-on` level it actually requested (never a `fail_on` the report
+claims for itself), and refuses the whole report if the two disagree. An
+in-source suppression that badfarm itself marks untrustworthy
+(`suppressed[i]["trusted"] is False`, for `critical`/`high` severities —
+missing `trusted` is read as trusted, for older badfarm output) is counted
+the same as an unsuppressed finding of that severity in this recomputation,
+since an author-controlled ignore comment is not evidence the finding is
+safe to drop.
+
+Evidence carries the verdict, counts by severity, the suppressed count and up
+to five findings as `rule file:line`. `data` holds `verdict`, `counts`,
+`top`, `suppressed` and `tool_version` for each path. The same scan is
+available by hand:
+
+```
+vpscfg fleet iac PATH [--fail-on critical|high|medium|low] [--format text|json]
+```
+
+Exit codes mirror badfarm's: 0 pass, 1 findings at or above `--fail-on` (or
+an incomplete scan), 2 refused. `--repo`, `--ref`, `--run` and `--output`
+are refused. A badfarm on PATH or in `$VPSCFG_BADFARM` that lies about its
+result is outside the gate's reach for anything the verdict recomputation
+cannot catch — whoever controls the environment controls the scanner.
 
 k3s contracts (`apply: {mode: k3s}`) swap the file-sync checks for live
 Deployment state; see [K3S-APPLY.md](K3S-APPLY.md).

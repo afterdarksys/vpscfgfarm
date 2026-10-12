@@ -48,6 +48,12 @@
   vpscfg fleet images [host ...]        contracted image pins vs live refs (read-only)
   vpscfg fleet postgres                 declared replication shape; UNPINNED until contracts name it
   vpscfg fleet os                       declared host OS; eol is a failure, and this is not a CVE scan
+  vpscfg fleet translate compose-to-k3s PATH --service NAME
+  vpscfg fleet translate k3s-to-compose PATH --container NAME
+                                        draft only; refuses --run; does not apply
+  vpscfg fleet iac PATH [--fail-on LEVEL] [--format text|json]
+                                        badfarm static IaC scan of a local path (read-only);
+                                        exit 0 pass, 1 findings/incomplete, 2 refused
   vpscfg lint                           contract quality floor (read-only)
   vpscfg module ...                     locked in v0; edit contracts/ in git
 
@@ -597,8 +603,14 @@ def _fleet(rest):
         return _fleet_postgres()
     if what == "os":
         return _fleet_os()
+    if what == "translate":
+        from . import translate
+        return translate.cli(rest[1:])
+    if what == "iac":
+        from . import iacgate
+        return iacgate.cli(rest[1:])
     if what != "hosts":
-        raise Refused("fleet %r not released in v0 (hosts, watch, baseline, changes, keys, secrets, escrow, firewall, k3s, never, dns, authkeys, coverage, health, twins, images, postgres, os)" % what)
+        raise Refused("fleet %r not released in v0 (hosts, watch, baseline, changes, keys, secrets, escrow, firewall, k3s, never, dns, authkeys, coverage, health, twins, images, postgres, os, translate, iac)" % what)
     machines = sshconfig.machines()
     print("fleet machines (from ~/.ssh/config):")
     for target, rec in sorted(machines.items()):
