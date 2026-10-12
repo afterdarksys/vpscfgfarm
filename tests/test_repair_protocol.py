@@ -189,6 +189,197 @@ class RepairProtocolTest(unittest.TestCase):
                 executor.apply(self.guard, self.contract, "deploy", "host", "service:host/web", [], reason="fixture",
                     ssh=lambda h, c: (1 if c.startswith("test ! -e") else 0, "", ""))
 
+    def host_request(self, recipe, change, operation_id="gf-host"):
+        request = dict(self.request)
+        request.update(operation_id=operation_id, recipe=recipe, transitions=[], change=change,
+                       binding=repair.describe(self.contract, self.root))
+        return request
+
+    def upgrade_change(self, **overrides):
+        change = {"family": "debian", "reboot": False, "packages": [
+            {"name": "zzhostpkg", "installed": "1.0", "candidate": "1.1", "archive": "stable"}]}
+        change.update(overrides)
+        return change
+
+    def assert_refused_without(self, request, text, needle):
+        with self.assertRaises(Refused) as caught:
+            repair.check_request(request, self.contract, self.root)
+        self.assertIn(text, str(caught.exception))
+        self.assertNotIn(needle, str(caught.exception))
+
+    def test_describe_advertises_host_recipes_and_keeps_the_deploy_recipe_field(self):
+        described = repair.describe(self.contract, self.root)
+        self.assertEqual(described["recipe"], repair.RECIPE)
+        self.assertEqual(described["supported_recipes"], list(repair.SUPPORTED_RECIPES))
+
+    def test_dirty_checkout_still_blocks_describe(self):
+        (self.source / "app").write_text("dirty")
+        with self.assertRaisesRegex(Refused, "clean"):
+            repair.describe(self.contract, self.root)
+
+    def test_service_deploy_accepts_transitions_and_refuses_a_change_object(self):
+        self.request["transitions"] = []
+        self.assertEqual(repair.check_request(self.request, self.contract, self.root)["recipe"], repair.RECIPE)
+        self.request["change"] = self.upgrade_change()
+        self.assert_refused_without(self.request, "change object", "zzhostpkg")
+
+    def test_unknown_recipe_is_refused_without_echoing_it(self):
+        self.request["recipe"] = "apt-get/v1"
+        self.assert_refused_without(self.request, "invalid operation or recipe", "apt-get")
+
+    def test_host_change_rejects_shell_metacharacters_without_echoing_them(self):
+        for name in ("openssl;id", "$(id)", "`id`", "-rf", "../openssl", "a..b", ".openssl"):
+            with self.subTest(name=name):
+                request = self.host_request(repair.DISTRO_SECURITY_UPGRADE, self.upgrade_change(packages=[
+                    {"name": name, "installed": "1", "candidate": "2", "archive": ""}]))
+                self.assert_refused_without(request, "invalid package name", name)
+
+    def test_upgrade_change_shape_fails_closed(self):
+        extra = self.upgrade_change(command="apt-get install zzhostpkg")
+        self.assert_refused_without(self.host_request(repair.DISTRO_SECURITY_UPGRADE, extra),
+                                    "invalid upgrade change", "apt-get")
+        alpine = self.upgrade_change(family="alpine")
+        self.assert_refused_without(self.host_request(repair.DISTRO_SECURITY_UPGRADE, alpine),
+                                    "invalid package family", "alpine")
+        for flag in (True, 1, "false", None):
+            with self.subTest(flag=flag):
+                request = self.host_request(repair.DISTRO_SECURITY_UPGRADE, self.upgrade_change(reboot=flag))
+                with self.assertRaisesRegex(Refused, "upgrade reboot flag must be false"):
+                    repair.check_request(request, self.contract, self.root)
+        empty = self.upgrade_change(packages=[])
+        with self.assertRaisesRegex(Refused, "invalid package list"):
+            repair.check_request(self.host_request(repair.DISTRO_SECURITY_UPGRADE, empty), self.contract, self.root)
+        too_many = self.upgrade_change(packages=[
+            {"name": "p%d" % i, "installed": "1", "candidate": "2", "archive": ""} for i in range(65)])
+        with self.assertRaisesRegex(Refused, "invalid package list"):
+            repair.check_request(self.host_request(repair.DISTRO_SECURITY_UPGRADE, too_many), self.contract, self.root)
+        duplicate = self.upgrade_change(packages=[
+            {"name": "zzhostpkg", "installed": "1", "candidate": "2", "archive": ""},
+            {"name": "zzhostpkg", "installed": "1", "candidate": "2", "archive": ""}])
+        self.assert_refused_without(self.host_request(repair.DISTRO_SECURITY_UPGRADE, duplicate),
+                                    "duplicate package name", "zzhostpkg")
+
+    def test_reboot_change_shape_and_real_package_versions(self):
+        kernel = "5.14.0-362.el9_3.x86_64"
+        reboot = {"family": "rpm", "packages": [], "reboot": True, "running_kernel": kernel}
+        self.assertEqual(repair.check_request(
+            self.host_request(repair.REBOOT, reboot), self.contract, self.root)["change"]["running_kernel"], kernel)
+        debian = self.upgrade_change(packages=[{
+            "name": "openssl", "installed": "3.0.11-1", "candidate": "1:2.36-9+deb12u7",
+            "archive": "3.0.11-1~deb12u2"}])
+        self.assertEqual(repair.check_request(
+            self.host_request(repair.DISTRO_SECURITY_UPGRADE, debian), self.contract, self.root)["recipe"],
+            repair.DISTRO_SECURITY_UPGRADE)
+        named = dict(reboot, packages=[{"name": "zzhostpkg"}])
+        self.assert_refused_without(self.host_request(repair.REBOOT, named),
+                                    "reboot change must not name packages", "zzhostpkg")
+        for flag in (False, 1, "true"):
+            with self.subTest(flag=flag):
+                request = self.host_request(repair.REBOOT, dict(reboot, reboot=flag))
+                with self.assertRaisesRegex(Refused, "reboot flag must be true"):
+                    repair.check_request(request, self.contract, self.root)
+        missing = {key: reboot[key] for key in reboot if key != "running_kernel"}
+        with self.assertRaisesRegex(Refused, "invalid reboot change"):
+            repair.check_request(self.host_request(repair.REBOOT, missing), self.contract, self.root)
+        bad_kernel = dict(reboot, running_kernel="5.14;reboot")
+        self.assert_refused_without(self.host_request(repair.REBOOT, bad_kernel),
+                                    "invalid running kernel", "reboot")
+
+    def test_upgrade_accepts_the_archive_badfarm_reads_from_apt_and_dnf(self):
+        for archive in ("Debian-Security:12/stable-security", "Ubuntu:22.04/jammy-security",
+                        "bookworm-security", "RHSA-2024:1234", ""):
+            with self.subTest(archive=archive):
+                request = self.host_request(repair.DISTRO_SECURITY_UPGRADE, self.upgrade_change(packages=[
+                    {"name": "openssl", "installed": "3.0.11-1~deb12u2", "candidate": "3.0.15-1~deb12u1",
+                     "archive": archive}]))
+                self.assertEqual(repair.check_request(request, self.contract, self.root)["recipe"],
+                                 repair.DISTRO_SECURITY_UPGRADE)
+
+    def test_upgrade_archive_refuses_traversal_and_metacharacters_without_echoing_them(self):
+        for archive in ("/etc/apt", "a/../b", "a//b", "a/", "-x", "stable;id", "$(id)/x", "a b", "x" * 129):
+            with self.subTest(archive=archive):
+                request = self.host_request(repair.DISTRO_SECURITY_UPGRADE, self.upgrade_change(packages=[
+                    {"name": "openssl", "installed": "1", "candidate": "2", "archive": archive}]))
+                self.assert_refused_without(request, "invalid package archive", archive)
+
+    def test_host_recipe_refuses_transitions_and_a_hand_edited_binding(self):
+        request = self.host_request(repair.DISTRO_SECURITY_UPGRADE, self.upgrade_change())
+        request["transitions"] = [{"from_asset_id": "asset-1"}]
+        with self.assertRaisesRegex(Refused, "asset transitions"):
+            repair.check_request(request, self.contract, self.root)
+        request = self.host_request(repair.DISTRO_SECURITY_UPGRADE, self.upgrade_change())
+        request["binding"] = dict(request["binding"], supported_recipes=["service-deploy/v1"])
+        with self.assertRaisesRegex(Refused, "changed"):
+            repair.check_request(request, self.contract, self.root)
+
+    def test_host_approve_uses_a_local_preflight_and_stage_zero_writes_nothing(self):
+        request = self.host_request(repair.DISTRO_SECURITY_UPGRADE, self.upgrade_change())
+        def boom(_contract):
+            raise AssertionError("live snapshot")
+        granted = repair.approve(request, self.contract, self.guard, repair.digest(request),
+                                 self.state, self.root, observe=boom)
+        self.assertEqual(len(granted["approval"]), 64)
+        import sqlite3
+        with sqlite3.connect(self.state) as db:
+            payload = json.loads(db.execute("SELECT payload FROM approvals").fetchone()[0])
+        self.assertEqual(payload["preflight"], repair.digest(
+            {"recipe": request["recipe"], "change": request["change"], "contact": "none"}))
+        self.assertNotIn("zzhostpkg", json.dumps(payload))
+        approved = [call.args[1] for call in repair.journal.append.call_args_list if call.args[1].get("event") == "approved"]
+        self.assertEqual(set(approved[0]), {"event", "operation_id", "request_digest"})
+        self.assertNotIn("zzhostpkg", json.dumps(approved[0]))
+        off = self.root / "absent.db"
+        self.guard.policy["mutation_enabled"] = False
+        with self.assertRaises(Refused):
+            repair.approve(request, self.contract, self.guard, repair.digest(request), off, self.root, observe=boom)
+        self.assertFalse(off.exists())
+
+    def test_host_execute_consumes_the_approval_and_sends_no_command(self):
+        request = self.host_request(repair.REBOOT, {
+            "family": "debian", "packages": [], "reboot": True, "running_kernel": "6.1.0-18-amd64"})
+        approval = repair.approve(request, self.contract, self.guard, repair.digest(request),
+                                  self.state, self.root, observe=lambda _c: (_ for _ in ()).throw(AssertionError("observe")))
+        apply = mock.Mock(side_effect=AssertionError("apply"))
+        with mock.patch("vpscfg.repair.live_snapshot", side_effect=AssertionError("snapshot")), \
+                mock.patch("vpscfg.repair.isolated_source", side_effect=AssertionError("source")), \
+                mock.patch("vpscfg.executor._default_ssh", side_effect=AssertionError("ssh")):
+            receipt = repair.execute(request, self.contract, self.guard, approval["approval"], self.state, self.root,
+                                     observe=lambda _c: (_ for _ in ()).throw(AssertionError("observe")),
+                                     apply=apply, recheck=lambda: self.guard)
+            again = repair.execute(request, self.contract, self.guard, approval["approval"], self.state, self.root,
+                                   observe=lambda _c: (_ for _ in ()).throw(AssertionError("observe")),
+                                   apply=apply, recheck=lambda: self.guard)
+        apply.assert_not_called()
+        self.assertEqual(receipt["state"], "refused")
+        self.assertEqual(again["state"], "refused")
+        self.assertEqual(receipt["error"], repair.HOST_NOT_GRADUATED)
+        self.assertEqual(receipt["steps"], [{"step": "host-recipe", "ok": False}])
+        self.assertNotIn("6.1.0-18-amd64", json.dumps(receipt))
+        import sqlite3
+        with sqlite3.connect(self.state) as db:
+            self.assertEqual(db.execute("SELECT used FROM approvals").fetchone()[0], 1)
+            stored = db.execute("SELECT payload FROM operations").fetchone()[0]
+        self.assertNotIn("6.1.0-18-amd64", stored)
+        refused = [call.args[1] for call in repair.journal.append.call_args_list if call.args[1].get("event") == "refused"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(set(refused[0]), {"event", "operation_id", "recipe", "request_digest"})
+        self.assertNotIn("6.1.0-18-amd64", json.dumps(refused[0]))
+
+    def test_host_execute_rechecks_the_governor_before_consuming_the_approval(self):
+        request = self.host_request(repair.DISTRO_SECURITY_UPGRADE, self.upgrade_change(), operation_id="gf-host-gate")
+        approval = repair.approve(request, self.contract, self.guard, repair.digest(request),
+                                  self.state, self.root, observe=lambda _c: "unused")
+        policy = copy.deepcopy(self.guard.policy)
+        policy["mutation_enabled"] = False
+        with self.assertRaises(Refused):
+            repair.execute(request, self.contract, self.guard, approval["approval"], self.state, self.root,
+                           apply=mock.Mock(side_effect=AssertionError("apply")),
+                           recheck=lambda: Guard(policy, True))
+        import sqlite3
+        with sqlite3.connect(self.state) as db:
+            self.assertEqual(db.execute("SELECT used FROM approvals").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

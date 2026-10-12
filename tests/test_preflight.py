@@ -121,6 +121,9 @@ class Base(unittest.TestCase):
         journal.JOURNAL_DIR = Path(self._tmp.name) / "journal"
         self._tel = mock.patch("vpscfg.telemetry.push_event")
         self._tel.start()
+        # Hermetic regardless of whether badfarm is installed on this machine.
+        self._iac = mock.patch("vpscfg.iacgate.locate", return_value=None)
+        self._iac.start()
         self.repo = str(Path(self._tmp.name) / "repo")
         Path(self.repo).mkdir()
         self.w = World(self.repo)
@@ -141,9 +144,11 @@ class Base(unittest.TestCase):
     def tearDown(self):
         journal.JOURNAL_DIR = self._orig
         self._tel.stop()
+        self._iac.stop()
         self._tmp.cleanup()
 
-    def run_pf(self, contract=None, guard=None, raw="", allow=False, host_contracts=None):
+    def run_pf(self, contract=None, guard=None, raw="", allow=False, host_contracts=None,
+               iac_scan=None):
         c = contract or self.contract
         contracts._validate(c, "test")
         return preflight.run(c, HOST, guard or self.guard, raw, ["docker restart shop-frontend"],
@@ -153,7 +158,8 @@ class Base(unittest.TestCase):
                              blackout_runner=self.w.blackout_runner,
                              fingerprint_report=self.w.fingerprint_report,
                              remote_runner=self.w.remote_runner,
-                             git_md5s=lambda repo, path: self.w.git_history)
+                             git_md5s=lambda repo, path: self.w.git_history,
+                             iac_scan=iac_scan)
 
     def status(self, report, name):
         return next(c for c in report["checks"] if c["name"] == name)["status"]
@@ -591,7 +597,7 @@ class CliTest(Base):
         names = [c["name"] for c in doc["checks"]]
         for expected in ("contract", "posture", "plan", "sync_plan", "drift", "outage",
                          "baseline", "backup", "ports", "fingerprint", "capacity",
-                         "blackout", "ansible"):
+                         "blackout", "ansible", "iac"):
             self.assertIn(expected, names)
         for c in doc["checks"]:
             self.assertEqual(set(c) - {"data"}, {"name", "status", "evidence"})
@@ -768,6 +774,221 @@ class ExecutorGateHookTest(Base):
                            preflight=lambda: preflight.require_fresh(c, HOST, token="t"))
         self.assertFalse(any("tar czf" in x or "restart" in x for x in calls))
         self.assertTrue(any("rmdir" in x for x in calls))  # lock released, nothing started
+
+
+def _iac_report(verdict="pass", findings=()):
+    return {"schema_version": 1, "kind": "iac-scan-report",
+            "tool": {"name": "badfarm", "version": "0.9.0"}, "source": {"path": "/x"},
+            "files": {"scanned": 3, "skipped": 0}, "findings": list(findings),
+            "suppressed": [], "coverage": [], "summary": {}, "verdict": verdict}
+
+
+IAC_FINDING = {"rule": "iac.ansible.ssh_service_stopped", "category": "lockout", "severity": "critical",
+               "file": "roles/ssh/tasks/main.yml", "line": 12, "title": "PermitRootLogin no "
+               "without a sudo user", "evidence": "PermitRootLogin no", "remediation": "add one"}
+
+
+class IacCheckTest(Base):
+    """preflight.iac across off/advisory/required x absent/pass/warn/block/
+    incomplete/refused. badfarm is never run: locate and the scan are faked."""
+
+    def _pf_iac(self, mode, scan, located="/opt/badfarm/bin/badfarm"):
+        if mode is not None:
+            self.contract["preflight"] = {"iac": mode}
+        with mock.patch("vpscfg.iacgate.locate", return_value=located):
+            r = self.run_pf(iac_scan=scan)
+        return next(c for c in r["checks"] if c["name"] == "iac"), r
+
+    def _verdict(self, verdict):
+        findings = [IAC_FINDING] if verdict in ("block", "warn") else []
+        return lambda path: _iac_report(verdict, findings)
+
+    def _refused(self, path):
+        raise Refused("badfarm output is not JSON: <masked>")
+
+    def test_matrix(self):
+        expected = {
+            # mode:      absent  pass    warn    block   incomplete refused
+            "off":      ("skip", "skip", "skip", "skip", "skip",    "skip"),
+            "advisory": ("skip", "pass", "warn", "warn", "warn",    "warn"),
+            "required": ("fail", "pass", "warn", "fail", "warn",    "fail"),
+        }
+        for mode, statuses in expected.items():
+            cases = [(None, self._verdict("pass"))] + \
+                [("/opt/badfarm/bin/badfarm", self._verdict(v))
+                 for v in ("pass", "warn", "block", "incomplete")] + \
+                [("/opt/badfarm/bin/badfarm", self._refused)]
+            for (located, scan), want in zip(cases, statuses):
+                check, _ = self._pf_iac(mode, scan, located=located)
+                self.assertEqual(check["status"], want, (mode, located, check["evidence"]))
+
+    def test_default_mode_is_advisory(self):
+        check, r = self._pf_iac(None, self._verdict("block"))
+        self.assertEqual(check["status"], "warn")
+        self.assertEqual(check["data"]["mode"], "advisory")
+        self.assertEqual(r["verdict"], "GO-WITH-WARNINGS")
+
+    def test_required_block_is_no_go_with_evidence(self):
+        check, r = self._pf_iac("required", self._verdict("block"))
+        self.assertEqual(r["verdict"], "NO-GO")
+        self.assertIn("verdict block", check["evidence"])
+        self.assertIn("critical=1", check["evidence"])
+        self.assertIn("iac.ansible.ssh_service_stopped roles/ssh/tasks/main.yml:12", check["evidence"])
+        self.assertEqual(check["data"]["scans"][0]["result"]["tool_version"], "0.9.0")
+
+    def test_absent_messages(self):
+        check, _ = self._pf_iac("required", None, located=None)
+        self.assertEqual(check["evidence"], "badfarm not installed; preflight.iac is required")
+        check, _ = self._pf_iac("advisory", None, located=None)
+        self.assertEqual(check["evidence"], "badfarm not installed; IaC gate not evaluated")
+
+    def test_bad_env_path_is_never_a_pass(self):
+        def bad_locate():
+            raise Refused("VPSCFG_BADFARM must be an absolute path")
+        self.contract["preflight"] = {"iac": "required"}
+        with mock.patch("vpscfg.iacgate.locate", side_effect=bad_locate):
+            r = self.run_pf(iac_scan=self._verdict("pass"))
+        self.assertEqual(self.status(r, "iac"), "fail")
+        self.contract["preflight"] = {"iac": "advisory"}
+        with mock.patch("vpscfg.iacgate.locate", side_effect=bad_locate):
+            r = self.run_pf(iac_scan=self._verdict("pass"))
+        self.assertEqual(self.status(r, "iac"), "warn")
+
+    def test_repo_scanned_and_playbook_dir_only_when_named(self):
+        seen = []
+        scan = lambda path: seen.append(path) or _iac_report()
+        self._pf_iac("advisory", scan)
+        self.assertEqual(seen, [Path(self.repo).resolve()])
+        seen.clear()
+        self.contract["playbook"] = "baseline"
+        with mock.patch("vpscfg.sshconfig.load", return_value={}):
+            check, _ = self._pf_iac("advisory", scan)
+        self.assertEqual(seen, [Path(self.repo).resolve(), preflight.playbook.PLAYBOOK_DIR])
+        self.assertEqual([s["path"] for s in check["data"]["scans"]], ["repo", "playbooks"])
+
+    def test_worst_status_across_paths_wins(self):
+        self.contract["playbook"] = "baseline"
+        scan = lambda path: _iac_report("block", [IAC_FINDING]) \
+            if path == preflight.playbook.PLAYBOOK_DIR else _iac_report()
+        with mock.patch("vpscfg.sshconfig.load", return_value={}):
+            check, _ = self._pf_iac("required", scan)
+        self.assertEqual(check["status"], "fail")
+        self.assertIn("repo: verdict pass", check["evidence"])
+        self.assertIn("playbooks: verdict block", check["evidence"])
+
+    def test_default_scan_goes_through_the_local_allowlist(self):
+        sent = []
+
+        def local(argv, timeout=300):
+            sent.append(list(argv))
+            if argv[1:3] == ["iac", "scan"]:
+                return 1, json.dumps(_iac_report("block", [IAC_FINDING])), ""
+            return self.w.local(argv, timeout)
+        self.contract["preflight"] = {"iac": "required"}
+        contracts._validate(self.contract, "test")
+        with mock.patch("vpscfg.iacgate.locate", return_value="/opt/badfarm/bin/badfarm"):
+            r = preflight.run(self.contract, HOST, self.guard, "", ["docker restart shop-frontend"],
+                              ssh=self.w.ssh, local=local, checks=self.w.checks,
+                              backup_verifier=self.w.backup_verifier,
+                              blackout_runner=self.w.blackout_runner,
+                              fingerprint_report=self.w.fingerprint_report,
+                              remote_runner=self.w.remote_runner,
+                              git_md5s=lambda repo, path: self.w.git_history)
+        scans = [a for a in sent if a[1:3] == ["iac", "scan"]]
+        self.assertEqual(scans, [["/opt/badfarm/bin/badfarm", "iac", "scan", "--format", "json",
+                                  "--fail-on", "high", "--", str(Path(self.repo).resolve())]])
+        self.assertIn(("local", scans[0]), r["commands_sent"])
+        self.assertEqual(self.status(r, "iac"), "fail")
+
+
+class IacAllowlistTest(Base):
+    EXE = "/opt/badfarm/bin/badfarm"
+
+    def setUp(self):
+        super(IacAllowlistTest, self).setUp()
+        # These tests exercise _assert_iac_scan_argv's shape checks, which
+        # only run once argv[0] is confirmed to BE the located badfarm — so
+        # locate() must agree with self.EXE for most of them.
+        self._loc = mock.patch("vpscfg.iacgate.locate", return_value=self.EXE)
+        self._loc.start()
+
+    def tearDown(self):
+        self._loc.stop()
+        super(IacAllowlistTest, self).tearDown()
+
+    def _ctx(self, local=None):
+        return preflight._Ctx(self.contract, HOST, self.guard, self.w.ssh,
+                              local or (lambda argv, timeout=300: (0, "{}", "")))
+
+    def _argv(self, exe=EXE):
+        return [exe, "iac", "scan", "--format", "json", "--fail-on", "high", "--", "/srv/repo"]
+
+    def test_accepts_the_exact_scan_argv(self):
+        ctx = self._ctx()
+        self.assertEqual(ctx.local(self._argv()), (0, "{}", ""))
+        self.assertEqual(ctx.sent, [("local", self._argv())])
+
+    def test_accepts_env_named_binary_only_when_it_is_the_located_one(self):
+        with mock.patch("vpscfg.iacgate.locate", return_value="/opt/tools/bf-1.0"):
+            self.assertEqual(self._ctx().local(self._argv("/opt/tools/bf-1.0")), (0, "{}", ""))
+            with self.assertRaises(Refused):
+                self._ctx().local(self._argv("/bin/sh"))
+
+    def test_basename_badfarm_at_the_wrong_path_is_refused(self):
+        # L2 regression: an argv[0] whose BASENAME is "badfarm" must still be
+        # refused unless it is exactly the path iacgate.locate() returned —
+        # a basename match alone proves nothing (anyone can name a file
+        # "badfarm"). locate() here resolves to self.EXE, not this one.
+        for impostor in ("/tmp/evil/badfarm", "/home/attacker/bin/badfarm", "./badfarm",
+                         self.EXE + ".fake"):
+            with self.assertRaises(Refused, msg=impostor):
+                self._ctx().local(self._argv(impostor))
+
+    def test_refuses_repo_and_ref(self):
+        for extra in (["--repo", "https://example.com/x.git"], ["--ref", "main"],
+                      ["--repo=https://example.com/x.git"], ["--ref=main"]):
+            argv = self._argv()
+            argv[5:5] = extra
+            with self.assertRaises(Refused, msg=extra):
+                self._ctx().local(argv)
+        argv = [self.EXE, "iac", "scan", "--format", "json", "--repo", "https://example.com/x.git",
+                "--ref", "main"]
+        with self.assertRaises(Refused):
+            self._ctx().local(argv)
+
+    def test_refuses_other_badfarm_subcommands_and_shapes(self):
+        bad = [
+            [self.EXE, "fleet", "run", "--format", "json", "--fail-on", "high", "--", "/srv/repo"],
+            [self.EXE, "iac", "fix", "--format", "json", "--fail-on", "high", "--", "/srv/repo"],
+            [self.EXE, "iac", "scan", "--format", "text", "--fail-on", "high", "--", "/srv/repo"],
+            [self.EXE, "iac", "scan", "--fail-on", "high", "--", "/srv/repo"],
+            [self.EXE, "iac", "scan", "--format", "json", "--fail-on", "never", "--", "/srv/repo"],
+            [self.EXE, "iac", "scan", "--format", "json", "--fail-on", "high", "--", "relative"],
+            [self.EXE, "iac", "scan", "--format", "json", "--fail-on", "high", "/srv/repo"],
+            self._argv() + ["--output", "/tmp/x"],
+            [self.EXE],
+        ]
+        for argv in bad:
+            with self.assertRaises(Refused, msg=argv):
+                self._ctx().local(argv)
+
+    def test_other_tools_still_refused(self):
+        with self.assertRaises(Refused):
+            self._ctx().local(["sh", "-c", "badfarm iac scan --format json"])
+
+
+class IacContractSchemaTest(Base):
+    def test_iac_modes(self):
+        for mode in ("off", "advisory", "required"):
+            contracts._validate(dict(self.contract, preflight={"iac": mode}), "test")
+        for bad in ("warn", "fail", "", "REQUIRED", True, None, 1, ["required"], {"mode": "off"}):
+            with self.assertRaises(Refused, msg=bad):
+                contracts._validate(dict(self.contract, preflight={"iac": bad}), "test")
+
+    def test_default_is_advisory(self):
+        self.assertEqual(preflight.settings(self.contract)["iac"], "advisory")
+        self.assertEqual(preflight.settings(dict(self.contract, preflight={"iac": "off"}))["iac"],
+                         "off")
 
 
 class WrapperDoorTest(unittest.TestCase):

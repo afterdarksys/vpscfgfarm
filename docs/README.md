@@ -16,6 +16,10 @@ vpscfg/
                        deploy --run (PREFLIGHT.md)
   k3sapply.py          k3s apply mode: schema, content-addressed image ref, fixed
                        commands; executor.py runs them (K3S-APPLY.md)
+  translate.py         draft-only compose <-> Deployment translator; fleet translate;
+                       never applies (WORKLOAD-DRAFT.md)
+  iacgate.py           badfarm static IaC scan of a local path: preflight `iac` check
+                       and `fleet iac`; never --repo (PREFLIGHT.md)
   vpsexec.py           separately governed ad-hoc fleet command execution
   commandtext.py       preserves literal arguments and command boundaries
   readpolicy.py        positive option grammars for automatic read execution
@@ -67,3 +71,4 @@ See [RECOVERY.md](RECOVERY.md) for interrupted execution and release checks.
 | [NO-PASTE.md](NO-PASTE.md) | Closing the loop between an agent and the human who approves |
 | [RECOVERY.md](RECOVERY.md) | Interrupted execution, retained locks, release checks |
 | [REPAIR-PROTOCOL.md](REPAIR-PROTOCOL.md) | The versioned machine interface for an external repair client |
+| [WORKLOAD-DRAFT.md](WORKLOAD-DRAFT.md) | Draft-only compose and Deployment translation |

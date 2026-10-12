@@ -178,6 +178,7 @@ CI treats a skipped test as a failure.
 | [docs/SECURITY-TOOLING.md](docs/SECURITY-TOOLING.md) | The read-only watchers |
 | [docs/RECOVERY.md](docs/RECOVERY.md) | Retained locks, partial deployments, release checks |
 | [docs/REPAIR-PROTOCOL.md](docs/REPAIR-PROTOCOL.md) | The versioned machine interface for goodfarm, badfarm's repair-planning module |
+| [docs/WORKLOAD-DRAFT.md](docs/WORKLOAD-DRAFT.md) | Draft-only compose and Deployment translation |
 
 ### Optional integrations (off by default)
 
@@ -197,6 +198,11 @@ setting and does nothing until you configure it:
 - **Maintenance windows**: a JSON export of active windows. Plans and
   preflight say which hosts are inside one, and `--require-blackout` refuses
   hosts that are not. Unset, every host's window status is "unknown".
+- **badfarm IaC scan**: a separately installed `badfarm` on PATH (or the
+  absolute path in `$VPSCFG_BADFARM`). `vpscfg fleet iac PATH` scans a local
+  tree (read-only; exit 0/1/2 as badfarm's), and preflight's `iac` check scans
+  the contract repo. Not installed: `fleet iac` refuses and the check skips
+  unless the contract says `preflight.iac: required` (docs/PREFLIGHT.md).
 - **Secret source**: the command `secret-put --from-pipe` runs (no shell) to
   read one secret from your keystore. Unset, `--from-pipe` refuses.
 

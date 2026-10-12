@@ -17,16 +17,40 @@ python3 vpscfg-control.py HOST deploy SERVICE --repair-action status --operation
 
 Run from the vpscfgfarm checkout so the wrapper can import its package. The
 goodfarm client sets this working directory. Describe/status perform no target
-mutations. Approve performs live read-only preflight and records local approval;
-apply requires `--run`, a matching single-use approval, and all normal executor
-gates. Protocol JSON goes to stdout and execution progress goes to stderr.
+mutations. Approve of `service-deploy/v1` performs live read-only preflight and
+records local approval. Approve of a host recipe records a local preflight
+digest (`contact: none`) and does not call the live snapshot. Apply requires
+`--run` and a matching single-use approval. `service-deploy/v1` also passes the
+normal executor gates. A host recipe does not. Protocol JSON goes to stdout and
+execution progress goes to stderr.
 
 ## Request and authorization
 
 Schema 1 `repair-request` includes an operation ID, exact goodfarm plan checksum,
 host/service, generated/expiry times, recipe ID, source/executor binding,
 ownership digest, affected services, restore-drill record and expected asset
-transitions. The implemented recipe is `service-deploy/v1`.
+transitions.
+
+The protocol accepts three recipes. `service-deploy/v1` is the one that can
+execute, and only through the existing deploy muscle. `distro-security-upgrade/v1`
+and `reboot/v1` can be described, approved, and bound. Apply of either host
+recipe consumes the single-use approval and records a refused receipt. It does
+not open SSH, does not build a package or reboot command, and does not call the
+executor. Describe still requires the service contract's clean source checkout,
+because one binding covers every recipe. A dirty tree blocks describe for a
+host recipe too. Host-recipe execution ignores those source bytes and does not
+rsync them. `describe` keeps `recipe` set to `service-deploy/v1` and adds
+`supported_recipes` listing all three. A host recipe request must send
+`transitions: []` and a reviewed change object with no extra keys.
+`service-deploy/v1` refuses a `change` key. Package names are shape-checked and
+are not interpolated into a shell. The `archive` field accepts apt's
+`origin:release/suite` form, such as `Debian-Security:12/stable-security`. It
+refuses `..`, empty path segments and a leading `/` or `-`. Approval of a host recipe records a local
+preflight digest and does not call the live snapshot. The same deploy governor
+gate still applies, so a stage-0 controller cannot approve one. The refused
+receipt is inserted inside the same transaction that consumes the approval, so
+a crash is not left `running`. Previously described approvals do not carry over
+because `executor_digest` and the new binding field move.
 
 The binding names the clean source Git revision and tracked file content/mode
 digest, the parsed contract digest, governor file digest, package/wrapper code
@@ -50,8 +74,10 @@ deny floor, ungraduated scope, disabled master switch or host posture.
 
 ## Execution, rollback and crash semantics
 
-Under a SQLite immediate transaction, apply consumes the approval and inserts a
-running operation before invoking the executor. An existing operation ID returns
+Under a SQLite immediate transaction, apply consumes the approval and inserts the
+operation. `service-deploy/v1` inserts it as running before invoking the executor.
+A host recipe inserts it as refused and returns. No executor call follows.
+An existing operation ID returns
 its existing receipt; a different request at that ID is refused. This prevents
 repeat execution after client timeouts. The database is local to this controller:
 never discard it to clear a failed operation, and do not assume a different
