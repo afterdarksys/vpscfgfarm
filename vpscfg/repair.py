@@ -2,6 +2,20 @@
 
 Approvals and operation receipts are local controller state. Exactly-once claim
 is limited to this controller database; running/unknown operations never retry.
+
+Threats:
+  - Protects against: replaying or transplanting an approval (only the SHA-256
+    of the bearer is stored, and it binds one request digest); a host recipe
+    becoming a shell command (package names and versions are shape-checked and
+    never interpolated; apply records refused and does not call the executor
+    or SSH); approving a host recipe from a live snapshot (preflight contact
+    is none); a service-deploy request smuggling a change object.
+  - Does NOT protect against: a later package-install or reboot muscle (none
+    is installed here); a dirty service checkout blocking describe for every
+    recipe, including host recipes; the operator's restore-drill veracity
+    (shape and freshness are checked, the drill itself is not re-run);
+    stage-0 mutation staying off (approve still requires the existing deploy
+    gate). The raw approval bearer is never logged.
 """
 
 import argparse
@@ -28,7 +42,20 @@ ROOT = Path(__file__).resolve().parent.parent
 STATE = ROOT / "journal" / "repair.sqlite3"
 GOVERNOR = Path(estate.current().governor)
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
+VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:+~_-]{0,127}\Z")
+# apt prints the archive as origin:release/suite, e.g. Debian-Security:12/stable-security.
+ARCHIVE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:+~_-]*(?:/[A-Za-z0-9][A-Za-z0-9.:+~_-]*)*\Z")
 RECIPE = "service-deploy/v1"
+DISTRO_SECURITY_UPGRADE = "distro-security-upgrade/v1"
+REBOOT = "reboot/v1"
+SUPPORTED_RECIPES = (RECIPE, DISTRO_SECURITY_UPGRADE, REBOOT)
+HOST_RECIPES = frozenset((DISTRO_SECURITY_UPGRADE, REBOOT))
+HOST_NOT_GRADUATED = "host recipe is bound and not graduated; no command was sent"
+PACKAGE_KEYS = frozenset(("name", "installed", "candidate", "archive"))
+UPGRADE_KEYS = frozenset(("family", "packages", "reboot"))
+REBOOT_KEYS = frozenset(("family", "packages", "reboot", "running_kernel"))
+MAX_PACKAGES = 64
 
 
 def now():
@@ -115,7 +142,8 @@ def describe(contract, root=ROOT):
     root = Path(root)
     code = {str(p.relative_to(root)): file_hash(p) for p in sorted((root / "vpscfg").glob("*.py"))}
     code["vpscfg-control.py"] = file_hash(root / "vpscfg-control.py")
-    return {"schema_version": 1, "recipe": RECIPE, "host": contract["host"], "service": contract["service"],
+    return {"schema_version": 1, "recipe": RECIPE, "supported_recipes": list(SUPPORTED_RECIPES),
+            "host": contract["host"], "service": contract["service"],
             "contract_digest": digest(contract), "policy_digest": file_hash(GOVERNOR if root == ROOT else root / "vpscfg-control.json"),
             "executor_digest": digest(code), "source": source_snapshot(contract), "directory_constraints": constraints(contract)}
 
@@ -145,7 +173,7 @@ def check_request(value, contract, root=ROOT):
     if any(not isinstance(value.get(k), str) or not value[k] for k in
            ("operation_id", "recipe", "host", "service", "generated_at", "expires_at", "plan_checksum")):
         raise Refused("request is missing required string fields")
-    if not NAME.fullmatch(value.get("operation_id", "")) or value.get("recipe") != RECIPE:
+    if not NAME.fullmatch(value.get("operation_id", "")) or value.get("recipe") not in SUPPORTED_RECIPES:
         raise Refused("invalid operation or recipe")
     if value.get("host") != contract["host"] or value.get("service") != contract["service"]:
         raise Refused("request host/service mismatch")
@@ -169,7 +197,69 @@ def check_request(value, contract, root=ROOT):
         raise Refused("recipe requires an explicit max_other_containers blast-radius limit")
     if not value.get("ownership_digest") or not value.get("affected_services"):
         raise Refused("recipe requires reviewed ownership and dependencies")
+    _check_recipe_shape(value)
     return value
+
+
+def _token(value, pattern):
+    return isinstance(value, str) and ".." not in value and pattern.fullmatch(value) is not None
+
+
+def _check_package(item):
+    if not isinstance(item, dict) or set(item) != PACKAGE_KEYS:
+        raise Refused("invalid package record")
+    if not _token(item["name"], TOKEN_RE):
+        raise Refused("invalid package name")
+    for key in ("installed", "candidate"):
+        if item[key] == "":
+            continue
+        if not _token(item[key], VERSION_RE):
+            raise Refused("invalid package version")
+    archive = item["archive"]
+    if archive != "" and not (_token(archive, ARCHIVE_RE) and len(archive) <= 128):
+        raise Refused("invalid package archive")
+
+
+def _check_host_change(recipe, change):
+    if not isinstance(change, dict):
+        raise Refused("host recipe requires a reviewed change")
+    if recipe == DISTRO_SECURITY_UPGRADE:
+        if set(change) != UPGRADE_KEYS:
+            raise Refused("invalid upgrade change")
+        if change.get("reboot") is not False:
+            raise Refused("upgrade reboot flag must be false")
+        if change.get("family") not in ("debian", "rpm"):
+            raise Refused("invalid package family")
+        packages = change.get("packages")
+        if not isinstance(packages, list) or not 1 <= len(packages) <= MAX_PACKAGES:
+            raise Refused("invalid package list")
+        seen = set()
+        for item in packages:
+            _check_package(item)
+            if item["name"] in seen:
+                raise Refused("duplicate package name")
+            seen.add(item["name"])
+        return
+    if set(change) != REBOOT_KEYS:
+        raise Refused("invalid reboot change")
+    if change.get("reboot") is not True:
+        raise Refused("reboot flag must be true")
+    if change.get("packages") != []:
+        raise Refused("reboot change must not name packages")
+    if change.get("family") not in ("debian", "rpm"):
+        raise Refused("invalid package family")
+    if not _token(change.get("running_kernel"), TOKEN_RE):
+        raise Refused("invalid running kernel")
+
+
+def _check_recipe_shape(value):
+    if value["recipe"] == RECIPE:
+        if "change" in value:
+            raise Refused("service deploy does not accept a change object")
+        return
+    if value.get("transitions") != []:
+        raise Refused("host recipe does not accept asset transitions")
+    _check_host_change(value["recipe"], value.get("change"))
 
 
 def live_snapshot(contract, ssh=None, run_local=None):
@@ -192,7 +282,11 @@ def approve(value, contract, guard, approve_digest, path=STATE, root=ROOT, obser
     if approve_digest != digest(value):
         raise Refused("approval must name the exact request digest")
     approval = secrets.token_hex(32)
-    payload = {"approved_at": now(), "operator": os.getuid(), "preflight": (observe or live_snapshot)(contract),
+    if value["recipe"] in HOST_RECIPES:
+        preflight = digest({"recipe": value["recipe"], "change": value["change"], "contact": "none"})
+    else:
+        preflight = (observe or live_snapshot)(contract)
+    payload = {"approved_at": now(), "operator": os.getuid(), "preflight": preflight,
                "request_digest": digest(value)}
     journal.append("repair", {"event": "approved", "operation_id": value["operation_id"], "request_digest": digest(value)})
     with database(path) as db, db:
@@ -231,10 +325,20 @@ def execute(value, contract, guard, approval, path=STATE, root=ROOT, observe=Non
     scope = "%s:%s/%s" % (contract.get("scope_kind", "service"), contract["host"], contract["service"])
     guard.assert_verb("deploy")
     guard.assert_mutation_allowed("deploy", contract["host"], scope)
+    host_recipe = value.get("recipe") in HOST_RECIPES
+    if host_recipe:
+        current_guard = (recheck or Guard.load)()
+        current_guard.assert_verb("deploy")
+        current_guard.assert_mutation_allowed("deploy", contract["host"], scope)
     receipt = {"schema_version": 1, "kind": "repair-receipt", "operation_id": operation_id,
                "request_digest": request_digest, "plan_checksum": value["plan_checksum"],
                "host": contract["host"], "service": contract["service"], "binding": value["binding"],
                "state": "running", "started_at": now(), "finished_at": None, "steps": []}
+    if host_recipe:
+        receipt["state"] = "refused"
+        receipt["error"] = HOST_NOT_GRADUATED
+        receipt["finished_at"] = now()
+        receipt["steps"] = [{"step": "host-recipe", "ok": False}]
     with database(path) as db:
         db.execute("BEGIN IMMEDIATE")
         existing = db.execute("SELECT request_digest FROM operations WHERE id=?", (operation_id,)).fetchone()
@@ -253,6 +357,13 @@ def execute(value, contract, guard, approval, path=STATE, root=ROOT, observe=Non
         db.execute("UPDATE approvals SET used=1 WHERE id=?", (approval_hash,))
         db.execute("INSERT INTO operations VALUES(?,?,?)", (operation_id, request_digest, json.dumps(receipt)))
         db.commit()
+    if host_recipe:
+        journal_record = journal.append("repair", {"event": "refused", "operation_id": operation_id,
+                                                   "recipe": value["recipe"], "request_digest": request_digest})
+        receipt["journal"] = {"stream": "repair", "record_digest": digest(journal_record)}
+        with database(path) as db, db:
+            db.execute("UPDATE operations SET payload=? WHERE id=?", (json.dumps(receipt), operation_id))
+        return receipt
 
     def persist():
         with database(path) as db, db:
