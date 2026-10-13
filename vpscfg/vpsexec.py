@@ -32,7 +32,15 @@ Gate order (all of it runs before anything executes):
    8. approval            TTY: type the host name. No TTY: --approve=<plan-hash>.
                           A step an approval contract lists may use
                           --approval-contract instead of typing (break-glass or
-                          not; vpsexecgrant.py); TTY still required.
+                          not; vpsexecgrant.py); TTY still required. A grant
+                          is spent only when asked: --grant FILE, or --grant
+                          auto (never one minted --for-release). With no flag
+                          a break-glass plan LISTS valid grants (for vpsrun)
+                          and asks for the typed phrase; --no-grant lists none.
+                          Under --incident (vpsexecincident.py) gates 4-5 skip
+                          only the runbook lookup for the incident's hosts, and
+                          approval is a typed GO:<host> (GO:<plan[:6]> for
+                          several) at the controlling TTY (no grant, no list).
    9. journal-or-refuse   an unauditable mutation must not happen.
   10. per-host lock       one mutation in flight per host; unknown completion retains it.
                           A locked or unreachable host fails that host only —
@@ -70,14 +78,15 @@ import os
 import re
 import secrets
 import shlex
+import socket
 import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from . import (blackout, journal, lock, mapfile, probe, secretmask, sshconfig, vpsexeclog,
-               vpsexecgrant, vpsexecpolicy)
+from . import (actions, blackout, detach, journal, lock, mapfile, probe, secretmask,
+               sshconfig, vpsexeclog, vpsexecgrant, vpsexecincident, vpsexecpolicy)
 from .control import Guard
 from .gates import DENY_ALWAYS_FLOOR, Refused, deny_scan, edit_distance
 from .commandtext import normalize, literal_words, has_expansion
@@ -559,6 +568,20 @@ def load_override(path, deny_patterns, today=None):
                 raise Refused("override file %s entry %d: invalid host %r"
                               % (path, n, h))
 
+        if "action" in entry or "with" in entry:
+            # A typed action (docs/ACTIONS.md) for non-break-glass hosts only.
+            where_n = "override file %s entry %d" % (path, n)
+            if entry.get("break_glass", False) is not False:
+                raise Refused("%s sets break_glass on an action — an ad-hoc --override "
+                              "file cannot elevate past a host's posture" % where_n)
+            if not str(entry.get("why", "")).strip():
+                raise Refused("%s missing 'why'" % where_n)
+            cmd, record = vpsexecpolicy.action_call(entry, deny_patterns, hosts, where_n)
+            entries.append({"hosts": list(hosts), "cmd": cmd, "where": "host",
+                            "why": entry["why"], "break_glass": False,
+                            "source": str(path), "verify": None, "action": record})
+            continue
+
         for key in ("cmd", "why"):
             if not str(entry.get(key, "")).strip():
                 raise Refused("override file %s entry %d missing %r" % (path, n, key))
@@ -597,6 +620,8 @@ def load_override(path, deny_patterns, today=None):
                 raise Refused(
                     "override file %s entry %d contains %r — substitution is not "
                     "overridable" % (path, n, bad))
+        if actions.is_reserved(cmd):
+            raise actions.reserved_refusal("override file %s entry %d" % (path, n))
 
         verify = entry.get("verify")
         if verify is not None:
@@ -807,8 +832,268 @@ def plan_hash(plan):
                    if plan["per_host"][h].get("verify_retry"))
     if retries:
         fields["verify_retry"] = retries
+    # Only when present, so every plan outside an incident keeps its old hash.
+    if plan.get("incident"):
+        fields["incident"] = plan["incident"]
+    # A typed action: the bytes that run, per host (S3). Only when present.
+    if plan.get("action"):
+        fields["action"] = dict((k, plan["action"][k]) for k in ACTION_HASH_KEYS)
     payload = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# typed actions (vpscfg/actions, docs/ACTIONS.md)
+#
+# `vpsexec <hosts> --action NAME --with JSON` reaches a typed action. Its
+# canonical string `vpscfg-action <name>@<v> '<json>'` is the plan's command:
+# the floor, deny_extra, risky_extra, runbook matching, grants and the
+# plan-hash all see it. The door, not the operator, builds the body from a
+# fixed template; the plan prints the body in full and the plan-hash binds its
+# sha256, the check's and the verify. Typing the canonical string is refused.
+#
+# Threats:
+#   - Protects against: an action running anywhere a committed runbook (or a
+#     non-break-glass override) does not name it (a mutation action is tier
+#     risky, so gate 4 applies; break-glass still needs a committed
+#     break_glass entry); bytes running that were not shown (body, check and
+#     verify are printed and hashed per host; REPLAN on any change); a
+#     template reaching the floor or a deny list (every byte is deny-scanned
+#     with the governor's and the policies' patterns before approval and again
+#     per host); a done-check that writes or lies (a shell check must classify
+#     as a read under classify(), a SQL check goes through the sqlread gate in
+#     a read-only session, a token-only check must be the pinned reviewed
+#     script of this very action (_gate_token; its output is never shown or
+#     journaled, only the token); its output must be exactly one token, anything else
+#     — extra lines, another case, nothing, rc != 0, a transport failure —
+#     fails the host closed with the body NOT run); a check releasing someone
+#     else's lock (it runs only after this operation took the lock, and never
+#     replaces reconcile); a read action that writes (its body must classify
+#     as a read too); actions under an incident (refused, D9).
+#   - Does NOT protect against: a reviewed template that is wrong (golden
+#     files and `expands:` make every change visible; they do not prove it
+#     right); a host that lies about the check (the host is trusted, as for
+#     every verify).
+# ---------------------------------------------------------------------------
+
+ACTION_HASH_KEYS = ("name", "version", "params", "tier", "per_host")
+ACTION_CHECK_TIMEOUT = 60  # a done-check is a read: the read timeout
+
+
+def _action_tier(action, tier, detail):
+    """The tier is fixed in code: read for a read action, otherwise risky (a
+    runbook or override must name it). A risky_extra hit on the canonical
+    string makes even a read action risky — policies only tighten."""
+    if tier == "risky":
+        return tier, detail
+    if action.tier == "read":
+        return "read", None
+    return "risky", ("typed action %s@%d — runs only where a runbook or override names it"
+                     % (action.name, action.version))
+
+
+TOKEN_FILE_KINDS = (None, "an environment file")
+
+
+def _gate_token(probe, what, deny, risky_extra, exp):
+    """A token-only check (actions.TokenCheck): the ONLY exemption from the
+    credential-file rule, and only for the registered script of `exp`'s own
+    action and version, with `exp`'s own parameters, for the registry's named
+    file parameter. That file may be an environment file; never a device,
+    /proc, /sys, an ssh host key, a key/.private file or registries.yaml.
+    The floor and deny lists scan the command and the whole stdin (S1)."""
+    if exp is None:
+        raise Refused("action %s: a token-only check runs only bound to its own action "
+                      "— refused" % what)
+    path = probe.bind(exp)  # Refused: other action, unregistered, swapped bytes
+    kind = readpolicy._credential_file(path)
+    if kind not in TOKEN_FILE_KINDS:
+        raise Refused("action %s reads %s, which is %s: a token-only check is exempt "
+                      "for an environment file only — refused" % (what, path, kind))
+    verdict = readpolicy._path_class(path)
+    if verdict:
+        raise Refused("action %s reads %s: %s — refused" % (what, path, verdict[1]))
+    for t in (probe.command(), probe.script()):
+        deny_scan(t, deny)
+    hit = next((p for p in (risky_extra or ()) if p in normalize(probe.text()).lower()), None)
+    if hit:
+        raise Refused("action %s matches the policy's risky_extra %r — refused at plan "
+                      "time" % (what, hit))
+
+
+def _gate_probe(probe, what, deny, risky_extra, exp=None):
+    """A check or verify: a shell text must classify as a read; a SqlCheck
+    passes the sqlread gate (one SELECT/SHOW, read-only session) and the
+    policies' risky_extra over its whole text; a TokenCheck passes
+    _gate_token."""
+    if isinstance(probe, actions.TokenCheck):
+        _gate_token(probe, what, deny, risky_extra, exp)
+        return
+    if isinstance(probe, actions.SqlCheck):
+        text = probe.text()  # pg_script() runs sqlread.classify, or refuses
+        for t in (probe.command(), probe.script()):
+            deny_scan(t, deny)
+        hit = next((p for p in (risky_extra or ()) if p in normalize(text).lower()), None)
+        if hit:
+            raise Refused("action %s matches the policy's risky_extra %r — refused at plan "
+                          "time" % (what, hit))
+        return
+    tier, detail = classify(probe, deny, risky_extra)
+    if tier != "read":
+        raise Refused("action %s %r classifies as %r%s, not a read — it runs with no "
+                      "approval of its own, so it must be unable to change anything"
+                      % (what, probe, tier, " (%s)" % detail if detail else ""))
+
+
+def _gate_action(expansions, deny, risky_extra):
+    for exp in expansions.values():
+        actions.deny_check(exp, deny, "--action")
+        if exp.tier == "read":
+            _gate_probe(exp.body, "body (a read action)", deny, risky_extra)
+        if exp.check is not None:
+            _gate_probe(exp.check, "done-check", deny, risky_extra, exp)
+        if exp.verify is not None:
+            _gate_probe(exp.verify, "verify", deny, risky_extra, exp)
+
+
+def _attach_action(plan, expansions):
+    """Steps, verify and the hashed action record, per host."""
+    per = {}
+    for host in plan["hosts"]:
+        exp = expansions[host]
+        ph = plan["per_host"][host]
+        ph["steps"] = [{"container": None, "remote": exp.body, "check": exp.check,
+                        "retry": exp.verify_retry if exp.tier == "read" else None}]
+        ph["verify"] = exp.verify_text()
+        ph["verify_probe"] = exp.verify
+        ph["verify_retry"] = exp.verify_retry if exp.verify is not None else None
+        per[host] = {"body_sha256": exp.body_sha256(), "check_sha256": exp.check_sha256(),
+                     "verify": exp.verify_text(),
+                     "retry": list(exp.verify_retry) if exp.verify_retry else None}
+    first = expansions[plan["hosts"][0]]
+    plan["action"] = {"name": first.name, "version": first.version, "params": first.params,
+                      "tier": first.tier, "idempotent": first.idempotent, "per_host": per,
+                      "canonical": first.canonical}
+
+
+def _action_fields(plan, per_host=True):
+    """Journal keys for an action plan (params masked); {} otherwise."""
+    act = plan.get("action")
+    if not act:
+        return {}
+    out = {"action": act["name"], "action_version": act["version"],
+           "params": secretmask.mask(actions.base.canonical_json(act["params"]))}
+    if per_host:
+        out["body_sha256"] = dict((h, v["body_sha256"]) for h, v in act["per_host"].items())
+    return out
+
+
+def _render_action_header(plan):
+    act = plan["action"]
+    hosts = plan["hosts"]
+    lines = ["  action  : %s@%d (%s%s)" % (
+        act["name"], act["version"], act["tier"],
+        ", idempotent" if act["idempotent"] else
+        "" if act["tier"] == "read" else ", NOT idempotent: no done-check")]
+    if act["tier"] != "read":
+        lines.append("  check   : %s" % ("skips a host whose check prints VPSCFG-DONE ([done], "
+                                         "body not run)" if act["idempotent"] else "none"))
+    retries = sorted(set(tuple(plan["per_host"][h]["steps"][0]["retry"])
+                         for h in hosts if plan["per_host"][h]["steps"][0].get("retry")))
+    for tries, interval in retries:
+        lines.append("  retry   : the probe, up to %d tries, %ds apart" % (tries, interval))
+    return lines
+
+
+def _render_action_step(label, step):
+    """The body IN FULL, then the check: what is approved is what runs."""
+    lines = ["  %s" % label, "    body:"]
+    lines += ["      %s" % l for l in step["remote"].splitlines()]
+    if step.get("check") is not None:
+        lines.append("    check:")
+        lines += ["      %s" % l for l in actions.probe_text(step["check"]).splitlines()]
+    return lines
+
+
+def _run_probe(host, probe, ssh, timeout, deny):
+    """One check or verify on a host: a shell text, or a SqlCheck with its
+    script on stdin (the password stays inside the container), or a
+    TokenCheck whose reviewed bytes are re-checked before they are sent."""
+    if isinstance(probe, actions.TokenCheck):
+        probe.pinned()
+    if isinstance(probe, (actions.SqlCheck, actions.TokenCheck)):
+        command, script = probe.command(), probe.script()
+        deny_scan(command, deny)
+        deny_scan(script, deny)
+        return ssh(host, command, timeout=timeout, data=script.encode("utf-8"))
+    deny_scan(probe, deny)
+    return ssh(host, probe, timeout=timeout)
+
+
+def _probe_token(probe, rc, out):
+    if rc != 0:
+        return None
+    if isinstance(probe, (actions.SqlCheck, actions.TokenCheck)):
+        return probe.token(_decode(out))
+    return actions.plain_token(_decode(out))
+
+
+def _action_already_done(host, plan, step, ssh, timeout, deny, lock_token):
+    """Run the done-check (lock held by THIS operation). True: DONE, skip the
+    body. False: NEEDED, run it. Anything else raises Refused: the host fails
+    closed and nothing ran (S6) — never "assume done", never "assume not"."""
+    probe = step["check"]
+    # A token-only check may read a secret file: nothing it printed, and no
+    # transport text, is ever shown or journaled — only the token or a fixed
+    # error class, rc and duration.
+    withheld = isinstance(probe, actions.TokenCheck)
+    started = time.monotonic()
+    fields = dict({"event": "action_check", "host": host, "operation_id": lock_token},
+                  **_action_fields(plan, per_host=False))
+    try:
+        rc, out, err = _run_probe(host, probe, ssh, min(timeout, ACTION_CHECK_TIMEOUT), deny)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        journal.append("vpsexec", dict(fields, token=None, rc=None, detail=(
+            "transport" if withheld else secretmask.mask("transport: %s" % e)[:200])))
+        raise Refused("done-check on %s failing closed, the step did not run: the check "
+                      "could not run (%s)" % (host, "transport lost" if withheld
+                                              else secretmask.mask(str(e))[:120]))
+    token = _probe_token(probe, rc, out)
+    extra = {"error": "not-a-token"} if withheld and token is None else {}
+    journal.append("vpsexec", dict(fields, token=token, rc=rc,
+                                   duration=round(time.monotonic() - started, 3), **extra))
+    if token is None and withheld:
+        raise Refused("done-check on %s failing closed, the step did not run: the "
+                      "token-only check did not print exactly %s or %s (rc=%s); its "
+                      "output is withheld, never shown" % (host, actions.DONE,
+                                                            actions.NEEDED, rc))
+    if token is None:
+        shown = secretmask.mask(_decode(out) or _decode(err) or "")[:80]
+        raise Refused("done-check on %s failing closed, the step did not run: it printed "
+                      "%r (rc=%s), not exactly %s or %s" % (host, shown, rc, actions.DONE,
+                                                            actions.NEEDED))
+    if token == actions.DONE:
+        journal.append("vpsexec", dict(fields, event="action_already_done",
+                                       plan_hash=plan_hash(plan)))
+        return True
+    return False
+
+
+def _run_read_retry(host, step, ssh, timeout):
+    """A read action's probe, retried inside the verify_retry bounds: up to
+    `tries` attempts, `interval` apart, all of it ending by a monotonic
+    deadline of VERIFY_RETRY_TOTAL_MAX. Passes on the first rc 0."""
+    tries, interval = step["retry"]
+    deadline = _verify_clock() + vpsexecpolicy.VERIFY_RETRY_TOTAL_MAX
+    attempt, rc, out, err = 0, 1, "", ""
+    for attempt in range(1, tries + 1):
+        left = deadline - _verify_clock()
+        rc, out, err = ssh(host, step["remote"], timeout=max(1, int(min(
+            timeout, VERIFY_ATTEMPT_TIMEOUT_MAX, left))))
+        if rc == 0 or attempt == tries or _verify_clock() + interval >= deadline:
+            break
+        _verify_sleep(interval)
+    return rc, out, err, attempt
 
 
 def render_plan(plan, digest):
@@ -862,16 +1147,25 @@ def render_plan(plan, digest):
         lines.append("  note    : %s is the same machine as %s — dropped" % (alias, kept))
     for host, why in plan.get("excluded", []):
         lines.append("  EXCLUDED: %s — %s (this plan does NOT reach it)" % (host, why))
+    if plan.get("incident"):
+        lines.append("  INCIDENT: %s — runbook lookup lifted for these hosts; "
+                     "approval is a typed GO" % plan["incident"])
     if plan["override_path"]:
         lines.append("  override: %s  sha256=%s"
                      % (plan["override_path"], plan["override_sha256"][:12]))
         for why in (plan["override_why"] or []):
             lines.append("  why     : %s" % why)
+    act = plan.get("action")
+    if act:
+        lines += _render_action_header(plan)
     lines.append("")
     lines.append("WILL RUN:")
     for host in hosts:
         for step in plan["per_host"][host]["steps"]:
             label = "%s / %s" % (host, step["container"]) if step["container"] else host
+            if act:
+                lines += _render_action_step(label, step)
+                continue
             lines.append("  %-28s %s" % (label, step["remote"]))
     total = sum(len(plan["per_host"][h]["steps"]) for h in hosts)
     lines.append("")
@@ -899,6 +1193,10 @@ BREAK_GLASS_APPROVE_REFUSAL = (
     "break-glass plans need your typed BREAK-GLASS phrase or an approval "
     "contract; --approve alone no longer approves break-glass (add "
     "--approval-contract=FILE)")
+
+
+# `--approval-contract=auto` / `--grant auto`: pick a valid covering grant.
+AUTO_GRANT = "auto"
 
 
 def check_plan_hash(approve_flag, digest):
@@ -1220,6 +1518,56 @@ def _default_ssh(host, remote_cmd, connect_timeout=8, timeout=120, data=None):
     return r.returncode, out, err
 
 
+# The real transport runs mutation steps detached (vpscfg/detach.py), so a
+# dropped session re-attaches instead of costing the deploy. An injected
+# transport opts in the same way; one that does not keeps the attached path.
+_default_ssh.detached = True
+
+
+def _decode(data):
+    return data.decode("utf-8", "replace") if isinstance(data, bytes) else (data or "")
+
+
+def _live_printer(host):
+    """Masked live log lines for a human watching a terminal. The WHOLE text so
+    far is re-masked on every update (the masker reads context: a Secret's
+    `data:` block, an unterminated PEM), and only complete lines are shown.
+    Captured runs (vpsrun, tests) see the output once, in the final render."""
+    if not sys.stderr.isatty():
+        return None
+    shown = {"out": 0, "err": 0}
+
+    def show(out, err):
+        for name, data in (("out", out), ("err", err)):
+            text = _decode(data[:256 * 1024])
+            text = text[:text.rfind("\n") + 1]
+            lines = secretmask.mask(text).splitlines()
+            for line in lines[shown[name]:]:
+                print("  %s %s| %s" % (host, "!" if name == "err" else " ", line),
+                      file=sys.stderr)
+            shown[name] = max(shown[name], len(lines))
+    return show
+
+
+def _run_step(host, step, idx, ssh, timeout, is_read, lock_token, unmanaged_ok=False):
+    """(rc, stdout, stderr) for one step. A mutation step on a detach-capable
+    transport is launched detached under the lock's operation id — on a host
+    without systemd only if the governor's allow_unmanaged_steps names it."""
+    if is_read or not lock_token or not getattr(ssh, "detached", False):
+        return ssh(host, step["remote"], timeout=timeout)
+    rc, out, err = detach.run(
+        host, lock_token, idx, step["remote"], lock_token, ssh, timeout,
+        progress=lambda msg: print("  [%s] %s" % (host, msg), file=sys.stderr),
+        on_output=_live_printer(host), unmanaged_ok=unmanaged_ok)
+    return rc, _decode(out), _decode(err)
+
+
+def _step_detail(out, err):
+    """The legacy summary field: stderr wins, 500 cap. Both full streams are
+    journaled beside it (`stdout`, `stderr`), on the uncertain path too."""
+    return (err or out or "")[:500]
+
+
 # Full step output kept in the journal (stdout and stderr, each capped), so a
 # human who ran a break-glass step in their own terminal can say "done" and
 # `vpsexec last` shows the result — nobody pastes output back by hand. The
@@ -1247,16 +1595,54 @@ def _run_one_host(host, plan, guard, reason, ssh, timeout, is_read):
     locked = False
     lock_token = None
     uncertain = False
+    still_running = False
+    unmanaged_ok = _allows_unmanaged(guard, host)
     try:
         if not is_read:
-            lock_token = lock.acquire(host, os.environ.get("USER", "unknown"), reason,
+            lock_token = lock.acquire(host, _operator(), reason,
                                       runner=lambda h, c: ssh(h, c))
             locked = True
         if plan.get("push"):
             _push_one_host(host, plan, guard.deny_patterns(), ssh, timeout, result)
-        for step in ([] if plan.get("push") else plan["per_host"][host]["steps"]):
+        steps = [] if plan.get("push") else plan["per_host"][host]["steps"]
+        act_fields = _action_fields(plan, per_host=False)
+        if act_fields:
+            act_fields["body_sha256"] = plan["action"]["per_host"][host]["body_sha256"]
+        for idx, step in enumerate(steps, 1):
             deny_scan(step["remote"], guard.deny_patterns())
-            rc, out, err = ssh(host, step["remote"], timeout=timeout)
+            # A typed action's done-check: after THIS operation took the lock,
+            # before the body. DONE skips the body and the verify; anything
+            # but NEEDED fails the host closed (Refused, nothing ran).
+            if (step.get("check") is not None and not is_read
+                    and _action_already_done(host, plan, step, ssh, timeout,
+                                             guard.deny_patterns(), lock_token)):
+                result["already_done"] = True
+                result["outputs"].append({
+                    "container": None, "rc": 0, "stderr": "", "compare_key": "",
+                    "stdout": "[done] already done: the check printed %s — body not run"
+                              % actions.DONE})
+                break
+            try:
+                if step.get("retry") and is_read:
+                    rc, out, err, attempts = _run_read_retry(host, step, ssh, timeout)
+                    result["attempts"] = attempts
+                else:
+                    rc, out, err = _run_step(host, step, idx, ssh, timeout, is_read,
+                                             lock_token, unmanaged_ok=unmanaged_ok)
+            except detach.DetachUnknown as e:
+                still_running = isinstance(e, detach.DetachStillRunning)
+                # Whatever the step printed before contact was lost is evidence.
+                pout, perr = secretmask.mask(_decode(e.out)), secretmask.mask(_decode(e.err))
+                result["outputs"].append({"container": step["container"], "rc": None,
+                                          "stdout": pout, "stderr": perr,
+                                          "compare_key": pout})
+                journal.append("vpsexec", dict({
+                    "event": "step", "host": host, "target": step["container"] or host,
+                    "remote": step["remote"], "rc": None, "uncertain": True,
+                    "operation_id": lock_token, "detail": _step_detail(pout, perr),
+                    "stdout": pout[:STEP_OUTPUT_CAP], "stderr": perr[:STEP_OUTPUT_CAP]},
+                    **act_fields))
+                raise
             # Masked HERE, before the output reaches the result, the journal,
             # --compare or the terminal: one choke point, nothing to forget.
             tagged = secretmask.mask(out, tags=True)
@@ -1271,14 +1657,16 @@ def _run_one_host(host, plan, guard, reason, ssh, timeout, is_read):
                 first = (err or out or "").strip().splitlines()[:1]
                 result["error"] = first[0][:120] if first else ""
             if not is_read:
-                journal.append("vpsexec", {
+                journal.append("vpsexec", dict({
                     "event": "step", "host": host, "target": step["container"] or host,
-                    "remote": step["remote"], "rc": rc, "detail": (err or out)[:500],
+                    "remote": step["remote"], "rc": rc, "operation_id": lock_token,
+                    "detail": _step_detail(out, err),
                     "stdout": (out or "")[:STEP_OUTPUT_CAP],
-                    "stderr": (err or "")[:STEP_OUTPUT_CAP]})
+                    "stderr": (err or "")[:STEP_OUTPUT_CAP]}, **act_fields))
 
         verify = plan["per_host"][host].get("verify")
-        if verify and result["rc"] == 0:
+        probe = plan["per_host"][host].get("verify_probe")
+        if verify and result["rc"] == 0 and not result.get("already_done"):
             tries, interval = plan["per_host"][host].get("verify_retry") or (1, 0)
             deadline = (_verify_clock() + vpsexecpolicy.VERIFY_RETRY_TOTAL_MAX
                         if tries > 1 else None)
@@ -1289,7 +1677,27 @@ def _run_one_host(host, plan, guard, reason, ssh, timeout, is_read):
                     left = deadline - _verify_clock()
                     attempt_timeout = max(1, int(min(timeout, VERIFY_ATTEMPT_TIMEOUT_MAX,
                                                      left)))
-                vrc, vout, verr = ssh(host, verify, timeout=attempt_timeout)
+                if probe is not None:
+                    # A typed action's verify: shell text or a SqlCheck. A
+                    # SqlCheck passes only on the exact VPSCFG-DONE row.
+                    try:
+                        vrc, vout, verr = _run_probe(host, probe, ssh, attempt_timeout,
+                                                     guard.deny_patterns())
+                    except (OSError, subprocess.TimeoutExpired):
+                        if isinstance(probe, actions.TokenCheck):
+                            raise OSError("token-only verify: transport lost") from None
+                        raise
+                    if isinstance(probe, (actions.SqlCheck, actions.TokenCheck)):
+                        vtok = _probe_token(probe, vrc, vout)
+                        vrc = 0 if vtok == actions.DONE else (vrc or 1)
+                    vout, verr = _decode(vout), _decode(verr)
+                    if isinstance(probe, actions.TokenCheck):
+                        # Withheld like the done-check: the token or a fixed
+                        # error class, never the output.
+                        vout, verr = (vtok or ""), ("" if vtok else
+                                                    "token-only verify: output withheld")
+                else:
+                    vrc, vout, verr = ssh(host, verify, timeout=attempt_timeout)
                 vout, verr = secretmask.mask(vout), secretmask.mask(verr)
                 result["verify_rc"] = vrc
                 result["verify_detail"] = (verr or vout or "").strip()[:200]
@@ -1331,17 +1739,53 @@ def _run_one_host(host, plan, guard, reason, ssh, timeout, is_read):
     finally:
         if locked:
             if uncertain:
-                result['error'] = ((result['error'] or '') + ' [BLOCKED: lock retained; reconcile operation %s]' % lock_token)
+                result["lock_retained"] = lock_token  # mutation_complete names it
+                result['error'] = ((result['error'] or '') + ' [BLOCKED: lock retained; reconcile '
+                                   'operation %s — next: vpsexec reconcile %s%s]'
+                                   % (lock_token, host, " --stop" if still_running else ""))
                 print(result['error'], file=sys.stderr)
             else:
                 try:
-                    released = lock.release(host, runner=lambda h, c: ssh(h, c), token=lock_token)
+                    # The op dir (step logs, exit codes) goes with the lock,
+                    # in the same remote command (only a detached step made one).
+                    released = lock.release(
+                        host, runner=lambda h, c: ssh(h, c), token=lock_token,
+                        op_dir=(detach.op_dir(lock_token)
+                                if getattr(ssh, "detached", False) else None))
                 except (OSError, subprocess.TimeoutExpired):
                     released = False
                 if not released:
                     result['rc'] = result['rc'] or 1
                     result['error'] = ((result['error'] or '') + ' [BLOCKED: lock not released]').strip()
+                else:
+                    # Written ONLY now — every step, the verify and the lock
+                    # release are behind it — so vpsrun --resume may treat this
+                    # host as finished. A per-step record is not enough: a door
+                    # that died between steps or during the verify wrote those.
+                    # It names its attempt (run-scoped reason + plan-hash), so
+                    # resume can never take another operation's host_done.
+                    journal.append("vpsexec", dict({
+                        "event": "host_done", "host": host, "operation_id": lock_token,
+                        "rc": result["rc"], "verify_rc": result["verify_rc"],
+                        "reason": reason, "plan_hash": plan_hash(plan)},
+                        **({"already_done": bool(result.get("already_done"))}
+                           if plan.get("action") else {})))
     return result
+
+
+def _allows_unmanaged(guard, host):
+    """The governor's explicit acceptance of the escape risk on a host without
+    systemd: `"allow_unmanaged_steps": ["<canonical host>", ...]`. An alias
+    name in the list counts for nothing (it would launder the canonical
+    host's risk decision); the canonical name of `host` must be listed."""
+    policy = getattr(guard, "policy", None) or {}
+    listed = policy.get("allow_unmanaged_steps") or []
+    if not isinstance(listed, list):
+        return False
+    cfg = (policy.get("hosts") or {}).get(host) or {}
+    canonical = cfg.get("alias_of") or host if isinstance(cfg, dict) else host
+    return canonical in listed and not ((policy.get("hosts") or {}).get(canonical) or {}
+                                        ).get("alias_of")
 
 
 def _host_stdout(result):
@@ -1401,13 +1845,21 @@ def _render_summary(results):
     lines = ["SUMMARY — %d host(s)" % len(results)]
     for r in results:
         note = r["error"] or ""
+        if not note and r.get("already_done"):
+            note = "already done (check), body not run"
         if not note and r["verify_rc"] == 0:
             note = "verify ok"
         lines.append("  [%-4s] %-24s rc=%-3s %s"
-                     % ("ok" if r["rc"] == 0 else "FAIL", r["host"], r["rc"], note))
+                     % (_status_label(r), r["host"], r["rc"], note))
     lines.append("  %d ok, %d failed of %d"
                  % (len(results) - len(failed), len(failed), len(results)))
     return "\n".join(lines)
+
+
+def _status_label(r):
+    if r["rc"] != 0:
+        return "FAIL"
+    return "done" if r.get("already_done") else "ok"
 
 
 def _run_serial(hosts, plan, guard, reason, ssh, timeout, is_read, announce=True):
@@ -1417,7 +1869,7 @@ def _run_serial(hosts, plan, guard, reason, ssh, timeout, is_read, announce=True
         results.append(r)
         if announce:
             note = r["error"] or ("verify ok" if r["verify_rc"] == 0 else "")
-            print("  [%s] %s rc=%s%s" % ("ok" if r["rc"] == 0 else "FAIL", host,
+            print("  [%s] %s rc=%s%s" % (_status_label(r), host,
                                          r["rc"], "  " + note if note else ""))
     return results
 
@@ -1461,7 +1913,7 @@ def execute(plan, guard, reason, approval, ssh=None, timeout=120, max_parallel=5
             "override": plan["override_path"],
             "override_sha256": plan["override_sha256"],
             "plan_hash": plan_hash(plan), "approval": approval, "reason": reason,
-            "push": plan.get("push")})
+            "push": plan.get("push"), **_incident_fields(plan), **_action_fields(plan)})
 
     halted = []
     if is_read and len(hosts) > 1:
@@ -1504,12 +1956,32 @@ def execute(plan, guard, reason, approval, ssh=None, timeout=120, max_parallel=5
 
     failed = [r for r in results if r["rc"] != 0]
     if not is_read:
+        # Hosts whose outcome is unknown and whose lock stays held, by
+        # operation id: vpsrun --resume refuses a step listed here until a
+        # `reconciled` record names that operation. Absent when there are none.
+        retained = dict((r["host"], r["lock_retained"]) for r in results
+                        if r.get("lock_retained"))
         journal.append("vpsexec", {
             "event": "mutation_complete", "hosts": hosts,
             "command": plan["command"],
             "results": dict((r["host"], r["rc"]) for r in results),
-            "failed": [r["host"] for r in failed], "not_run": halted})
+            "failed": [r["host"] for r in failed], "not_run": halted,
+            **({"lock_retained": retained} if retained else {}),
+            **({"action_body_sha256": _action_fields(plan)["body_sha256"],
+                "already_done": [r["host"] for r in results if r.get("already_done")]}
+               if plan.get("action") else {}),
+            **_incident_fields(plan)})
+    if plan.get("incident_record"):
+        print(vpsexecincident.banner(plan["incident_record"]))
     return 1 if (failed or halted) else 0
+
+
+def _incident_fields(plan):
+    """Journal keys tying a mutation to its incident, so `incident close` can
+    report it. Absent outside an incident: those records are unchanged."""
+    if not plan.get("incident"):
+        return {}
+    return {"incident": plan["incident"], "plan_hash": plan_hash(plan)}
 
 
 def _confirm_continue(remaining, stream, prompt):
@@ -1539,7 +2011,8 @@ def _confirm_continue(remaining, stream, prompt):
 # Reserved: these can never be host names. Validated against the governor so a
 # host called "log" fails loudly instead of shadowing a verb.
 RESERVED_VERBS = frozenset(["hosts", "groups", "runbooks", "checks", "check",
-                            "locks", "log", "last", "help", "grant"])
+                            "locks", "log", "last", "help", "grant", "reconcile",
+                            "incident", "runbook"])
 REPEAT_WINDOW_SECONDS = 300
 
 USAGE = """vpsexec — run a command across a fleet, or inside its containers.
@@ -1569,13 +2042,24 @@ Execution
                        odd one out.
   --override=FILE      an ad-hoc YAML authorisation file
   --break-glass        reach frozen/lockdown hosts, backed by a committed runbook
+  --incident=ID        an open incident (`vpsexec incident open`) stands in for
+                       the committed runbook on the hosts it lists. Typed
+                       GO:<host> (GO:<plan[:6]> for several) at the TTY; never
+                       --approve, --approval-contract or --grant.
   --require-blackout   refuse hosts not inside an active maintenance window
   --approve=HASH       non-interactive approval of one exact plan-hash
-  --approval-contract=FILE
+  --approval-contract=FILE | --grant FILE
                        a grant from `vpsexec grant new` replaces the typed
                        BREAK-GLASS phrase for a step it lists (or, when no host
                        needs elevation, that step's ordinary phrase). TTY still
                        required. Invalid for this plan => refused, no prompt.
+                       Omitted: valid grants are LISTED, never used; the typed
+                       phrase follows.
+  --approval-contract=auto | --grant auto
+                       auto-pick a VALID covering grant (short before reusable,
+                       soonest-expiring first; never one minted --for-release);
+                       refuses if none covers it.
+  --no-grant           never list or use a grant: the typed phrase only.
   --timeout N          per-host timeout in seconds. Default: a runbook's timeout:,
                        else predicted from the command (read 60s, rollout/pull
                        240s, script/install 300s), capped at 300s
@@ -1586,6 +2070,16 @@ Push a file (a mutation: --run, --reason, posture, approval all apply)
                        /var/tmp/vpscfg-push/<sha256>/<basename>. The file must
                        hash to --sha256; the gates see `vpscfg-push <sha> <name>`.
 
+Typed actions (docs/ACTIONS.md)
+  vpsexec <hosts> --action NAME --with '{"param": value, ...}' [--run --reason "why"]
+                       a closed vocabulary of declarative steps. The door builds
+                       the body from reviewed code, prints it in full with its
+                       done-check, and the plan-hash binds those bytes. A
+                       mutation action runs only where a runbook (`action:` +
+                       `with:`) or a non-break-glass override names it. The
+                       gates see `vpscfg-action <name>@<v> '<json>'`; typing
+                       that string yourself is refused.
+
 Named read plays (policies/checks.yaml)
   vpsexec check                 list the checks available
   vpsexec check disk [hosts]    run one; its default host set is in the policy
@@ -1594,15 +2088,41 @@ Named read plays (policies/checks.yaml)
                                 the whole command must STILL classify as a read
   A check's command must be a read, so a check can never be a way to mutate.
 
+Runbook checks (see `vpsexec runbook --help`)
+  vpsexec runbook lint <policy.yaml>       static: shape, expiry, timeouts,
+                                           push artifacts, STOP steps, plays
+  vpsexec runbook preflight <policy.yaml>  read tier only: the policy's
+                                           assumes: block against the hosts
+
 Approval contracts (see `vpsexec grant --help`)
   vpsexec grant new <runbook> --ttl 1h [--steps 1-20,23] [--hosts h] [--run]
+  vpsexec grant new <policy> --kind reusable --ttl 12h [--max-uses N]
+                    [--for-release NAME] [--run]   (committed, clean files only)
   vpsexec grant list | show <file> | revoke <session_id>
+
+Incident override (see `vpsexec incident --help`) — customer outage only
+  vpsexec incident open --hosts h1,h2 --ttl <15m|30m|1h|2h|4h> --reason "why"
+  vpsexec incident status | close <ic_id>
 
 Introspection (read-only, no host needed)
   vpsexec hosts        governed hosts: posture, alias, reachability, window
   vpsexec groups       host groups from policies/*.yaml
   vpsexec runbooks     authorisations in force, with expiry
   vpsexec locks <hosts>  who holds the per-host mutation lock
+
+Release valve (a human, in a terminal)
+  vpsexec reconcile <host>
+                 a lock RETAINED after a dropped session or a timeout: shows the
+                 owner, the step's exit code and log tail, whether it still runs,
+                 and the runbook's verify; then, unless it still runs (any
+                 process of the step's group or unit), its controller is alive
+                 here, or it has no op dir and is younger than twice the
+                 longest step (7200s), asks for RECONCILE:<host>:<op8> and
+                 releases THAT operation's lock (and its op dir) only.
+  vpsexec reconcile <host> --stop
+                 TERM a STILL RUNNING operation's step(s) and their whole
+                 process group: STOP:<host>:<op8>, journaled; releases
+                 nothing — reconcile afterwards.
   vpsexec last [HOST] [-n N]
                  the last N mutation runs IN FULL: command, approval, every
                  step's output, verify, result. Run it yourself, then say "done".
@@ -1636,7 +2156,9 @@ def parse_args(argv, push=False):
             "override": None, "run": False, "reason": None, "approve": None,
             "timeout": None, "break_glass": False, "verify": None, "canary": 0,
             "compare": False, "require_blackout": False, "sha256": None,
-            "push_file": None, "approval_contract": None}
+            "push_file": None, "approval_contract": None, "incident": None,
+            "grant_flag": "--approval-contract", "no_grant": False,
+            "action": None, "with": None}
     positional = []
     i = 0
     while i < len(argv):
@@ -1681,12 +2203,34 @@ def parse_args(argv, push=False):
             opts["approve"] = _value(argv, i, "--approve"); i += 1
         elif a.startswith("--approval-contract="):
             opts["approval_contract"] = a.split("=", 1)[1]
+            opts["grant_flag"] = "--approval-contract"
         elif a == "--approval-contract":
             opts["approval_contract"] = _value(argv, i, "--approval-contract"); i += 1
+            opts["grant_flag"] = "--approval-contract"
+        elif a.startswith("--grant="):  # `--grant auto` / `--grant FILE`: same flag
+            opts["approval_contract"] = a.split("=", 1)[1]
+            opts["grant_flag"] = "--grant"
+        elif a == "--grant":
+            opts["approval_contract"] = _value(argv, i, "--grant"); i += 1
+            opts["grant_flag"] = "--grant"
+        elif a == "--no-grant":
+            opts["no_grant"] = True
+        elif a.startswith("--incident="):
+            opts["incident"] = a.split("=", 1)[1]
+        elif a == "--incident":
+            opts["incident"] = _value(argv, i, "--incident"); i += 1
         elif a.startswith("--timeout="):
             opts["timeout"] = a.split("=", 1)[1]
         elif a == "--timeout":
             opts["timeout"] = _value(argv, i, "--timeout"); i += 1
+        elif not push and a.startswith("--action="):
+            opts["action"] = a.split("=", 1)[1]
+        elif not push and a == "--action":
+            opts["action"] = _value(argv, i, "--action"); i += 1
+        elif not push and a.startswith("--with="):
+            opts["with"] = a.split("=", 1)[1]
+        elif not push and a == "--with":
+            opts["with"] = _value(argv, i, "--with"); i += 1
         elif push and a.startswith("--sha256="):
             opts["sha256"] = a.split("=", 1)[1]
         elif push and a == "--sha256":
@@ -1698,12 +2242,32 @@ def parse_args(argv, push=False):
         i += 1
 
     if opts["approval_contract"] is not None and not opts["approval_contract"].strip():
-        raise Refused("--approval-contract needs a file path")
+        raise Refused("--approval-contract needs a file path (or auto)")
+    if opts["approval_contract"] is not None and opts["approval_contract"].strip() == "auto":
+        opts["approval_contract"] = AUTO_GRANT  # a file named auto is ./auto
+    if opts.get("no_grant") and opts["approval_contract"] is not None:
+        raise Refused("--no-grant and %s contradict each other — pass one"
+                      % opts["grant_flag"])
+    if opts["incident"] is not None:
+        if not opts["incident"].strip():
+            raise Refused("--incident needs an incident id (ic_...)")
+        if opts["approve"] or opts["approval_contract"] is not None:
+            raise Refused("--incident is approved by a typed GO at your terminal "
+                          "only — not with --approve, --approval-contract or --grant")
     if push:
         if len(positional) != 3 or positional[1] != PUSH_VERB:
             raise Refused("usage: vpsexec <hosts> push <local-file> --sha256 <hex> "
                           "[--run --reason \"why\"]")
         opts["host"], opts["push_file"] = positional[0], positional[2]
+    elif opts["action"] is not None:
+        # `<hosts> --action NAME --with JSON`: the door builds the command.
+        if len(positional) != 1:
+            raise Refused("usage: vpsexec <hosts> --action NAME --with JSON [flags] — a "
+                          "typed action takes no command text (got %d positional "
+                          "argument(s))" % len(positional))
+        opts["host"] = positional[0]
+    elif opts["with"] is not None:
+        raise Refused("--with gives a typed action its parameters; it needs --action NAME")
     elif len(positional) < 2:
         raise Refused("usage: vpsexec <hosts> '<command>' [flags]  (see --help)")
     elif len(positional) > 2:
@@ -1910,6 +2474,435 @@ def _render_locks(hosts, ssh, timeout=30):
     return "\n".join(lines)
 
 
+# ---- reconcile: the release valve for a retained lock ---------------------
+#
+# Threats:
+#   - Protects against: a retained lock needing hand-ssh and hand-rmdir on a
+#     frozen host (2026-10-12); releasing a lock whose operation is still
+#     running (refused outright — a running unit, a live runner pid, or any
+#     process naming the op dir is STILL RUNNING, checked again after the
+#     phrase); releasing a different operation's lock (owner and token are
+#     read, must agree with each other, and are compared byte-for-byte in the
+#     same remote command that removes them); an agent or script releasing
+#     locks (controlling-TTY check before any host is contacted, pending
+#     keystrokes flushed, a phrase naming the host and the op); an unaudited
+#     release (journal-or-refuse: the evidence is journaled before the lock is
+#     touched, and `reconciled` after it is released).
+#   - Does NOT protect against: a human typing the phrase over evidence that
+#     says UNKNOWN without reading it (UNKNOWN is a judgment call by design);
+#     a lock with no op dir (taken by `vpscfg deploy`, a push, or a door from
+#     before detached steps), whose running state this tool cannot prove; a
+#     command that left work running outside its own process (a backgrounded
+#     daemon) — the runbook verify is the check for that.
+
+RECONCILE_VERIFY_TIMEOUT = 60
+
+
+def _journal_context(host, op):
+    """The mutation_attempt that preceded this op's steps, and the steps."""
+    records = vpsexeclog.read()
+    steps = [r for r in records if r.get("event") == "step" and r.get("host") == host
+             and r.get("operation_id") == op]
+    attempt = None
+    if steps:
+        first = records.index(steps[0])
+        for r in reversed(records[:first]):
+            if r.get("event") == "mutation_attempt" and host in (r.get("hosts") or []):
+                attempt = r
+                break
+    return attempt, steps
+
+
+def _reexpand_action(command, host):
+    """The Expansion an op's journaled canonical string (`vpscfg-action
+    name@N '<json>'`) stands for, rebuilt by THIS door's code; Refused when it
+    does not parse, names a version this door cannot expand, or re-expands to
+    a different canonical string."""
+    try:
+        words = shlex.split(command)
+    except ValueError as e:
+        raise Refused("the journaled canonical does not parse (%s)" % e)
+    if len(words) != 3 or words[0] != actions.ACTION_CANONICAL:
+        raise Refused("the journaled command is not one canonical action string")
+    params = actions.parse_with_json(words[2], "the journaled canonical's JSON")
+    exp = actions.expand(words[1], params, host, "reconcile")
+    if exp.canonical != command:
+        raise Refused("the journaled canonical re-expands to a different string")
+    return exp
+
+
+def _reconcile_verify(host, attempt, policy, aliases):
+    """(command, source, expansion): for a typed action, its verify re-expanded
+    from the journaled canonical by this door (never the plan's text, which
+    for a SqlCheck or TokenCheck is a heredoc no classifier rates a read);
+    otherwise the verify of the runbook entry that authorised the op's
+    command, else the verify its plan carried. (None, None, None) if none;
+    (None, why, None) when an action cannot be re-expanded."""
+    if not attempt:
+        return None, None, None
+    if actions.is_reserved(attempt.get("command") or ""):
+        try:
+            exp = _reexpand_action(attempt.get("command") or "", host)
+        except (Refused, ValueError) as e:
+            return None, "cannot re-expand the action (%s)" % secretmask.mask(str(e))[:160], None
+        if exp.verify is None:
+            return None, None, exp
+        return exp.verify_text(), "action %s@%d, re-expanded" % (exp.name, exp.version), exp
+    targets = (attempt.get("targets") or {}).get(host) or []
+    containers = list(targets) if attempt.get("placement") == "container" else None
+    try:
+        entry = lookup(authorizations(policy, None), [host], attempt.get("command") or "",
+                       attempt.get("placement") or "host", aliases=aliases,
+                       containers=containers).get(host)
+    except Refused:
+        entry = None
+    if entry and entry.get("verify"):
+        return normalize(entry["verify"]), entry.get("source") or "runbook", None
+    planned = (attempt.get("verify") or {}).get(host)
+    if planned:
+        return normalize(planned), "the op's plan", None
+    return None, None, None
+
+
+def _reconcile_run_action_verify(host, exp, ssh, deny, risky_extra):
+    """(label, rc, detail) for an action's re-expanded verify, through the
+    same gate and runner as a run: a shell text must classify as a read, a
+    SqlCheck runs in its read-only session, a TokenCheck is bound to its own
+    action and its output is withheld (only the token or a fixed error
+    class). rc is None when it did not run."""
+    probe = exp.verify
+    withheld = isinstance(probe, actions.TokenCheck)
+    if isinstance(probe, actions.TokenCheck):
+        label = "token-only check %s" % probe.key
+    elif isinstance(probe, actions.SqlCheck):
+        label = "SQL check in %s/%s" % (probe.container, probe.database)
+    else:
+        label = probe
+    try:
+        _gate_probe(probe, "verify", deny, risky_extra, exp)
+    except Refused as e:
+        return label, None, "refused by the gate, not run (%s)" % secretmask.mask(str(e))[:160]
+    try:
+        rc, out, err = _run_probe(host, probe, ssh, RECONCILE_VERIFY_TIMEOUT, deny)
+    except Refused as e:
+        return label, None, "refused, not run (%s)" % secretmask.mask(str(e))[:160]
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return label, None, ("transport lost" if withheld
+                             else "transport: %s" % secretmask.mask(str(e))[:120])
+    if isinstance(probe, (actions.SqlCheck, actions.TokenCheck)):
+        token = _probe_token(probe, rc, out)
+        if withheld:
+            detail = token or "token-only verify: output withheld"
+        else:
+            detail = token or secretmask.mask(_decode(err) or _decode(out) or "").strip()[:200]
+        return label, 0 if token == actions.DONE else (rc or 1), detail
+    return label, rc, secretmask.mask(_decode(err) or _decode(out) or "").strip()[:200]
+
+
+def _operator():
+    return vpsexecgrant.operator()  # the password database, never $USER
+
+
+def longest_step_seconds():
+    """The longest any single step holding a host lock may run, from the real
+    caps: a runbook `timeout:` (vpsexecpolicy.RUNBOOK_TIMEOUT_MAX), an
+    executor step (executor.MAX_STEP_SECONDS), a k3s rollout wait
+    (k3sapply.MAX_TIMEOUT, waited with 60 s of slack)."""
+    from . import executor, k3sapply
+    return max(vpsexecpolicy.RUNBOOK_TIMEOUT_MAX, executor.MAX_STEP_SECONDS,
+               k3sapply.MAX_TIMEOUT + 60)
+
+
+# A lock with no op dir (vpscfg deploy, push, an older door) proves nothing
+# about whether its work still runs; it may be released only once it is older
+# than twice the longest step any lock holder may run.
+UNPROVEN_LOCK_MIN_AGE = None  # computed on first use: unproven_lock_min_age()
+
+
+def unproven_lock_min_age():
+    return UNPROVEN_LOCK_MIN_AGE or 2 * longest_step_seconds()
+
+
+def _pid_alive(pid):
+    """Only a real, positive pid can be alive: 0 or -1 would make kill()
+    address a process group, and a non-integer is not a pid."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def _live_controller(meta):
+    """The controller that took this lock, if it is THIS machine and its pid
+    is alive — whatever the journal says (`vpscfg deploy` journals no vpsexec
+    attempt): that process may still be working, so the lock is not anyone's
+    to release. "Alive" means that pid exists AND its process started when
+    the controller recorded (`started`, its own start time): a pid number now
+    held by a later or earlier process is a recycled pid, i.e. a dead
+    controller. A controller field that is present but malformed (including
+    a `started` that is not a positive integer: null, 0, negative), or a live
+    pid whose start time cannot be read, counts as live (fail closed); a lock
+    without one (an older door) is judged by the other rules."""
+    ctl = meta.get("controller")
+    if ctl is None:
+        return None
+    if not isinstance(ctl, dict) or not isinstance(ctl.get("host"), str):
+        return {"host": "?", "pid": "?", "started": "malformed controller field"}
+    if ctl.get("host") != socket.gethostname():
+        return None
+    pid = ctl.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return {"host": ctl.get("host"), "pid": pid, "started": "malformed pid"}
+    if not _pid_alive(pid):
+        return None
+    started = ctl.get("started")
+    actual = lock.process_start(pid)
+    if (actual is None or isinstance(started, bool) or not isinstance(started, int)
+            or started <= 0):
+        return ctl  # alive, and its identity cannot be checked: fail closed
+    if abs(actual - started) > lock.START_TOLERANCE:
+        return None  # a recycled pid: the controller itself is gone
+    return ctl
+
+
+def reconcile(argv, guard, policy, ssh=None, stream=None, prompt=None):
+    """`vpsexec reconcile <host> [--stop]`: evidence first, then one typed
+    phrase. With --stop it stops the op's unit or processes (STOP:<host>:<op8>)
+    and releases nothing; a normal reconcile then applies."""
+    stop = argv[1:] == ["--stop"]
+    if stop:
+        argv = argv[:1]
+    if len(argv) != 1 or argv[0].startswith("-"):
+        raise Refused("usage: vpsexec reconcile <host> [--stop]   (one host)")
+    stream = stream if stream is not None else sys.stdin
+    # Before any host is contacted: this is a human's release valve.
+    vpsexecgrant._require_tty(stream, "vpsexec reconcile")
+    hosts_cfg = guard.policy.get("hosts", {})
+    resolved = resolve_hosts(argv[0], policy.get("groups", {}), hosts_cfg)
+    if len(resolved["hosts"]) != 1:
+        raise Refused("reconcile takes exactly one host; %r resolves to %d"
+                      % (argv[0], len(resolved["hosts"])))
+    host = resolved["hosts"][0]
+    # Lock bookkeeping, not a change to the service: the token, master switch
+    # and mode apply; posture does not (break-glass is what took the lock).
+    guard.assert_exec_elevated(host)
+    ssh = ssh or _default_ssh
+    runner = lambda h, c: ssh(h, c, timeout=detach.POLL_TIMEOUT)  # noqa: E731
+
+    held = lock.read_owner(host, runner=runner)
+    print("RECONCILE — %s" % host)
+    if held is None:
+        print("  lock      : free — nothing to reconcile")
+        # Evidence for vpsrun --resume: a step whose outcome was never recorded
+        # holds no lock here, so it settles as "lock free" (and runs again).
+        journal.append("vpsexec", {"event": "reconcile_free", "host": host,
+                                   "reconciled_by": _operator()})
+        return 0
+    meta = held["meta"] or {}
+    op = held["token"]
+    print("  lock      : HELD (%s)" % lock.LOCK_DIR)
+    print("  operator  : %s" % secretmask.mask(str(meta.get("operator", "?"))))
+    print("  reason    : %s" % secretmask.mask(str(meta.get("reason", "?")))[:200])
+    print("  operation : %s" % (meta.get("operation_id") or "(owner unreadable)"))
+    if not lock.consistent(held) or not detach.OP_RE.match(op):
+        journal.append("vpsexec", {"event": "reconcile_refused", "host": host,
+                                   "why": "owner/token mismatch"})
+        raise Refused("the lock on %s has an owner and token that do not agree (or are "
+                      "unreadable) — not a lock this door wrote as one operation. "
+                      "Nothing was released; inspect %s by hand." % (host, lock.LOCK_DIR))
+    live = _live_controller(meta)
+    if live:
+        journal.append("vpsexec", {"event": "reconcile_refused", "host": host,
+                                   "operation_id": op, "why": "controller alive",
+                                   "controller": live})
+        raise Refused("the process that took this lock is still alive on THIS machine "
+                      "(pid %s, started %s) — it may still be working (a vpscfg deploy, a "
+                      "vpsexec door or a vpsrun play it ran). Find it: `ps -o pid,lstart,"
+                      "args -p %s`. If it is that door, let it finish; if it is stuck, end "
+                      "it (kill %s) — then reconcile. Nothing was released."
+                      % (live.get("pid"), live.get("started"), live.get("pid"),
+                         live.get("pid")))
+
+    def gather():
+        try:
+            return detach.inspect(host, op, ssh)
+        except (OSError, subprocess.TimeoutExpired, detach.PollError) as e:
+            raise Refused("cannot read the op dir on %s (%s) — no evidence, no release"
+                          % (host, e))
+
+    evidence = gather()
+    print("  op dir    : %s  (%d step(s))" % (detach.op_dir(op), len(evidence["steps"])))
+    if not evidence["steps"]:
+        print("  WARNING   : NO OP DIR. This lock was taken by `vpscfg deploy`, a push, or "
+              "a door from before detached steps. Whether its work still runs is NOT "
+              "provable here — check the host before you type the phrase.")
+    for st in evidence["steps"]:
+        print("  step %-4d : %s, %s, %s, via %s"
+              % (st["idx"], "exit rc=%d" % st["rc"] if st["rc"] is not None else "NO exit file",
+                 "RUNNING" if st["running"] else "not running", st["state"], st["how"]))
+        for name, label in (("out", "stdout"), ("err", "stderr")):
+            tail = secretmask.mask(_decode(st[name])).strip()
+            if tail:
+                print("     %s tail:" % label)
+                for line in tail.splitlines()[-15:]:
+                    print("       %s" % line)
+    print("  processes : %s" % (secretmask.mask(evidence["procs"])[:300]
+                                if evidence["procs"] else "none name the op dir"))
+
+    attempt, jsteps = _journal_context(host, op)
+    if attempt:
+        print("  journal   : %s  (reason: %s)"
+              % (secretmask.mask(attempt.get("command") or "?"),
+                 secretmask.mask(str(attempt.get("reason") or "?"))[:120]))
+    else:
+        print("  journal   : no record of this op on this controller")
+    verify, source, vexp = _reconcile_verify(host, attempt, policy,
+                                             governor_aliases(hosts_cfg))
+    vrc, vdetail = None, ""
+    deny = list(guard.deny_patterns()) + list(policy.get("deny_extra", []))
+    if vexp is not None and vexp.verify is not None:
+        # A typed action: its own verify, re-expanded, through the run's gate
+        # and runner. Evidence only — the verdict and the phrase still decide.
+        verify, vrc, vdetail = _reconcile_run_action_verify(
+            host, vexp, ssh, deny, policy.get("risky_extra", []))
+        print("  verify    : %s (%s) -> %s %s"
+              % (verify, source, "not run:" if vrc is None else "ok" if vrc == 0
+                 else "FAILED rc=%s" % vrc, vdetail))
+    elif verify:
+        try:
+            tier, _ = classify(verify, deny, policy.get("risky_extra", []))
+        except Refused as e:
+            # Unclassifiable is "not a plain read": never run, never fatal —
+            # the evidence and the RECONCILE phrase still decide.
+            tier = "refused (%s)" % secretmask.mask(str(e))[:120]
+        if tier != "read":
+            print("  verify    : %s (%s) is not a plain read [%s] — not run"
+                  % (secretmask.mask(verify)[:200], source, tier))
+        else:
+            try:
+                vrc, vout, verr = ssh(host, verify, timeout=RECONCILE_VERIFY_TIMEOUT)
+                vdetail = secretmask.mask(verr or vout or "").strip()[:200]
+            except (OSError, subprocess.TimeoutExpired) as e:
+                vdetail = "transport: %s" % secretmask.mask(str(e))[:120]
+            print("  verify    : %s (%s) -> %s %s"
+                  % (verify, source, "ok" if vrc == 0 else "FAILED rc=%s" % vrc, vdetail))
+    else:
+        print("  verify    : %s" % ("%s — not run" % source if source else "none declared"))
+
+    state, rc = detach.verdict(evidence)
+    print("")
+    print("VERDICT: %s" % ("COMPLETED rc=%d" % rc if state == "COMPLETED" else state))
+    record = {"host": host, "operation_id": op, "owner": meta, "verdict": state, "rc": rc,
+              "steps": [{"idx": s["idx"], "rc": s["rc"], "running": s["running"],
+                         "state": s["state"], "how": s["how"],
+                         "stdout_tail": secretmask.mask(_decode(s["out"]))[-1000:],
+                         "stderr_tail": secretmask.mask(_decode(s["err"]))[-1000:]}
+                        for s in evidence["steps"]],
+              "procs": secretmask.mask(evidence["procs"])[:500],
+              "verify": verify, "verify_rc": vrc, "verify_detail": vdetail,
+              "journal_steps": len(jsteps), "lock_age": held.get("age"),
+              "reconciled_by": _operator()}
+    if stop:
+        return _reconcile_stop(host, op, state, record, ssh, stream, prompt)
+    if state == "STILL RUNNING":
+        raise Refused("operation %s on %s is STILL RUNNING — nothing to reconcile; the lock "
+                      "stays. Re-run `vpsexec reconcile %s` once it has finished, or stop "
+                      "it first: vpsexec reconcile %s --stop" % (op[:8], host, host, host))
+    if not evidence["steps"]:
+        age, need = held.get("age"), unproven_lock_min_age()
+        if age is None or age < need:
+            raise Refused(
+                "the lock on %s has NO op dir, so whether its work still runs cannot be "
+                "proven, and it is %s old; it may be released only once it is at least "
+                "%ds old (twice the longest step a lock holder may run). Nothing was "
+                "released; re-run later, after the manual checks in docs/RECOVERY.md."
+                % (host, "an unknown time" if age is None else "%ds" % age, need))
+
+    want = "RECONCILE:%s:%s" % (host, op[:8])
+    vpsexecgrant.flush_input(stream)
+    prompt = prompt or (lambda msg: input(msg))
+    if prompt("Type %s to release this operation's lock, anything else aborts: "
+              % want).strip() != want:
+        raise Refused("reconcile phrase did not match %r — the lock stays" % want)
+
+    # Again, after the human read and typed: nothing may have started since.
+    if detach.verdict(gather())[0] == "STILL RUNNING":
+        raise Refused("operation %s on %s started running again while you read — the "
+                      "lock stays" % (op[:8], host))
+    journal.append("vpsexec", dict(record, event="reconcile_attempt"))  # or refuse
+    if not lock.release_matching(host, held, runner=runner, op_dir=detach.op_dir(op)):
+        journal.append("vpsexec", {"event": "reconcile_failed", "host": host,
+                                   "operation_id": op})
+        raise Refused("the lock on %s no longer matches operation %s (owner or token "
+                      "changed) — another operation holds it now; nothing was released"
+                      % (host, op[:8]))
+    journal.append("vpsexec", dict(record, event="reconciled"))
+    print("  [ok] lock released for operation %s on %s, op dir removed (journaled: "
+          "reconciled)" % (op[:8], host))
+    return 0
+
+
+def _reconcile_stop(host, op, state, record, ssh, stream, prompt):
+    """`reconcile <host> --stop`: TTY (already checked) and STOP:<host>:<op8>;
+    journal-or-refuse before anything is signalled. Releases nothing."""
+    if state != "STILL RUNNING":
+        print("  nothing is running for operation %s — nothing to stop. Reconcile it: "
+              "vpsexec reconcile %s" % (op[:8], host))
+        return 0
+    want = "STOP:%s:%s" % (host, op[:8])
+    vpsexecgrant.flush_input(stream)
+    prompt = prompt or (lambda msg: input(msg))
+    if prompt("Type %s to stop this operation's step(s), anything else aborts: "
+              % want).strip() != want:
+        raise Refused("stop phrase did not match %r — nothing was stopped" % want)
+    journal.append("vpsexec", dict(record, event="reconcile_stop_attempt"))  # or refuse
+    try:
+        rc, out, err = ssh(host, detach.stop_cmd(op), timeout=detach.POLL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        journal.append("vpsexec", {"event": "reconcile_stop_failed", "host": host,
+                                   "operation_id": op, "why": secretmask.mask(str(e))[:200]})
+        raise Refused("could not reach %s to stop operation %s (%s) — the lock stays"
+                      % (host, op[:8], e))
+    refused = [l for l in (out or "").splitlines() if l.startswith(detach.STOP_REFUSED)]
+    if refused:
+        parts = refused[0].split()
+        why, step, pgid = (parts + ["?", "?", "?"])[1:4]
+        journal.append("vpsexec", {"event": "reconcile_stop_refused", "host": host,
+                                   "operation_id": op, "why": why, "step": step,
+                                   "pgid": pgid, "stopped_by": _operator()})
+        raise Refused(
+            "nothing was signalled: step %s's process group %s on %s is %s — %s, so "
+            "the group's identity cannot be proven and --stop will not signal it. "
+            "Act by hand on the host: `ps -o pid,pgid,lstart,args -g %s`, end what "
+            "belongs to this operation, then run `vpsexec reconcile %s`."
+            % (step, pgid, host, why.upper(),
+               "its leader pid now belongs to a process started at another time"
+               if why == "reused" else "its leader is gone and its remaining members "
+               "could not all be proven the step's (Linux /proc: same session, started "
+               "no earlier than the leader, and the step's VPSCFG_OP tag in its "
+               "environment; other systems cannot prove it)",
+               pgid, host))
+    stopped = detach.STOPPED in (out or "")
+    journal.append("vpsexec", {"event": "reconcile_stopped" if stopped
+                               else "reconcile_stop_failed", "host": host,
+                               "operation_id": op, "rc": rc,
+                               "detail": secretmask.mask((err or out or "").strip())[:200],
+                               "stopped_by": _operator()})
+    if not stopped:
+        raise Refused("stopping operation %s on %s did not confirm (rc=%s) — the lock stays"
+                      % (op[:8], host, rc))
+    print("  [ok] stop sent to operation %s on %s (journaled). The lock stays: next, "
+          "reconcile it with the evidence:\n  vpsexec reconcile %s" % (op[:8], host, host))
+    return 0
+
+
 def _parse_since(text):
     """'90s' '30m' '2h' '7d' -> seconds."""
     if text is None:
@@ -2106,6 +3099,11 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
         for note in vpsexecpolicy.expiry_notes(policy, today=today):
             print(note, file=sys.stderr)
 
+    # The governor names the remote branch reusable grants are bound to
+    # (validated with the governor; default origin/main).
+    policy = dict(policy, policy_remote=guard.policy.get("policy_remote")
+                  or dict(vpsexecgrant.DEFAULT_POLICY_REMOTE))
+
     if argv[0] == "check":
         return _run_check(argv[1:], guard, policy, prober=prober, ssh=ssh,
                           stream=stream, prompt=prompt, today=today,
@@ -2121,6 +3119,18 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
             stream=stream, prompt=prompt,
             classify=lambda cmd: classify(cmd, grant_deny,
                                           policy.get("risky_extra", []))[0])
+
+    if argv[0] == "reconcile":
+        return reconcile(argv[1:], guard, policy, ssh=ssh, stream=stream, prompt=prompt)
+
+    if argv[0] == "incident":
+        return vpsexecincident.cli(argv[1:], hosts_cfg, stream=stream, prompt=prompt)
+
+    if argv[0] == "runbook":
+        # Lint is local; preflight sends only fixed reads, each classified by
+        # classify() above and refused unless it comes back `read`.
+        from . import runbookcheck
+        return runbookcheck.cli(argv[1:], guard, policy, ssh=ssh, today=today)
 
     if argv[0] in RESERVED_VERBS:
         return _introspect(argv[0], argv[1:], guard, policy, ssh, blackout_runner)
@@ -2139,9 +3149,27 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
         opts["command"] = push["command"]
     else:
         opts = parse_args(argv)
+    action, action_params = None, None
+    if not push and opts["action"] is not None:
+        # `<hosts> --action NAME --with JSON`: typed literals in, the canonical
+        # string out. The door builds the body; nothing here is operator text.
+        for flag, set_ in (("--in/--in-match/--in-all", opts["in"] or opts["match"]
+                            or opts["all"]), ("--verify", opts["verify"]),
+                           ("--incident", opts["incident"])):
+            if set_:
+                raise Refused("%s does not apply to a typed action — it owns its "
+                              "placement and verify, and incidents take no actions (D9)"
+                              % flag)
+        action = actions.get(opts["action"], "--action")
+        action_params = actions.validate(action, actions.parse_with_json(opts["with"]),
+                                         "--action %s" % action.name)
+        opts["command"] = actions.canonical(action, action_params)
+    elif not push:
         if normalize(opts["command"]).split()[:1] == [PUSH_CANONICAL]:
             raise Refused("%r is the reserved spelling of `vpsexec <hosts> push` "
                           "— use the push verb" % PUSH_CANONICAL)
+        if actions.is_reserved(opts["command"]):
+            raise actions.reserved_refusal("this command")
     # The YAML layer may only tighten: patterns are added, never removed.
     deny = list(guard.deny_patterns()) + list(policy.get("deny_extra", []))
     risky_extra = policy.get("risky_extra", [])
@@ -2156,7 +3184,8 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
     if mapdoc:
         deny += mapdoc["constraints"]["deny_extra"]
         risky_extra = list(risky_extra) + mapdoc["constraints"]["risky_extra"]
-        if mapdoc["constraints"]["forbid_break_glass"] and opts["break_glass"]:
+        if mapdoc["constraints"]["forbid_break_glass"] and (
+                opts["break_glass"] or opts["incident"]):
             raise Refused("%s forbids --break-glass from this directory — "
                           "elevation does not launch from here" % mapdoc["path"])
         if mapdoc["constraints"]["require_blackout"]:
@@ -2174,6 +3203,12 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
 
     # Gates 1-3: floor, unanalyzable, tier.
     tier, detail = classify(opts["command"], deny, risky_extra)
+    expansions = None
+    if action:
+        tier, detail = _action_tier(action, tier, detail)
+        expansions = dict((h, actions.expand(action.name, action_params, h, "--action"))
+                          for h in hosts)
+        _gate_action(expansions, deny, risky_extra)
     if push and tier == "read":
         raise Refused("a push classified as a read — refusing; a push is "
                       "always a mutation")
@@ -2194,6 +3229,18 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
             raise Refused("--canary %d leaves no hosts behind it (%d in the plan)"
                           % (opts["canary"], len(hosts)))
 
+    # The incident override. Consulted only after the floor, deny_extra, the
+    # map and the tier have run, and only for mutations: it can lift the
+    # runbook lookup below for the hosts it lists, nothing else.
+    incident = None
+    if opts["incident"]:
+        if tier == "read":
+            raise Refused("--incident applies to mutations; a read needs no "
+                          "incident and runs as it always does")
+        incident = vpsexecincident.check(opts["incident"])
+        vpsexecincident.authorize(incident, hosts, governor_aliases(hosts_cfg))
+        print(vpsexecincident.banner(incident))
+
     # Gate 4: authorisation — committed runbooks plus any ad-hoc override file.
     override = load_override(opts["override"], deny, today=today) if opts["override"] else None
     entries = authorizations(policy, override)
@@ -2211,7 +3258,7 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
             raise Refused('every vpsexec mutation requires --reason "why" — the '
                           "2am question is always 'why was this run'")
 
-        if tier == "risky":
+        if tier == "risky" and not incident:
             unauthorised = [h for h in hosts if auth[h] is None]
             if unauthorised:
                 raise Refused(
@@ -2233,17 +3280,24 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
         blocked = [h for h in hosts if postures[h] not in ("test", "released")]
         if blocked:
             if not opts["break_glass"]:
+                how = ("  This command names incident %s, which stands in for the "
+                       "runbook on these hosts — but elevation past posture is "
+                       "still explicit: add --break-glass." % incident["incident_id"]
+                       if incident else
+                       "  A committed break_glass runbook plus --break-glass reaches "
+                       "them; in a customer outage with no such runbook, open an "
+                       "incident (vpsexec incident open) and add --incident <id> "
+                       "--break-glass. Otherwise change posture in "
+                       "vpscfg-control.json — deliberately, in git.")
                 raise Refused(
-                    "%d of %d host(s) refuse mutations by posture: %s\n"
-                    "  During an incident, a committed break_glass runbook plus "
-                    "--break-glass reaches them. Without one, change posture in "
-                    "vpscfg-control.json — deliberately, in git.%s"
+                    "%d of %d host(s) refuse mutations by posture: %s\n%s%s"
                     % (len(blocked), len(hosts),
-                       ", ".join("%s(%s)" % (h, postures[h]) for h in blocked),
+                       ", ".join("%s(%s)" % (h, postures[h]) for h in blocked), how,
                        "\n  This command is a mutation, not a read: %s" % detail
                        if tier == "mutating" and detail else ""))
             unbacked = [h for h in blocked
-                        if not (auth[h] and auth[h].get("break_glass"))]
+                        if not incident
+                        and not (auth[h] and auth[h].get("break_glass"))]
             if unbacked:
                 raise Refused(
                     "--break-glass needs a committed break_glass runbook naming "
@@ -2282,8 +3336,14 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
                           "targets %s — refusing" % (host, named,
                                                      per_host_targets.get(host) or "the host"))
 
-    verify = _resolve_verify(opts, hosts, auth, deny, risky_extra)
-    verify_retry = _resolve_verify_retry(opts, hosts, auth, verify)
+    if expansions:
+        # The action's own verify (gated in _gate_action), never the entry's.
+        verify = dict((h, e.verify_text()) for h, e in expansions.items() if e.verify)
+        verify_retry = dict((h, e.verify_retry) for h, e in expansions.items()
+                            if e.verify and e.verify_retry)
+    else:
+        verify = _resolve_verify(opts, hosts, auth, deny, risky_extra)
+        verify_retry = _resolve_verify_retry(opts, hosts, auth, verify)
 
     # Gate 7: the plan. Always shown, before anything can happen.
     plan = build_plan(hosts, opts["command"], per_host_targets, tier, detail,
@@ -2299,6 +3359,11 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
     if push:
         plan["push"] = dict((k, v) for k, v in push.items() if k != "data")
         plan["push_data"] = push["data"]
+    if incident:
+        plan["incident"] = incident["incident_id"]
+        plan["incident_record"] = incident
+    if expansions:
+        _attach_action(plan, expansions)
     digest = plan_hash(plan)
 
     # Pre-flight: scan every constructed command on every host BEFORE approval,
@@ -2310,6 +3375,16 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
             deny_scan(plan["per_host"][host]["verify"], deny)
 
     print(render_plan(plan, digest))
+    if incident:
+        print(vpsexecincident.banner(incident))
+    if expansions:
+        # Journal-or-refuse: an action plan nobody can trace must not run.
+        journal.append("vpsexec", dict({
+            "event": "action_planned", "hosts": hosts, "command": plan["command"],
+            "tier": tier, "plan_hash": digest,
+            "check_sha256": dict((h, v["check_sha256"])
+                                 for h, v in plan["action"]["per_host"].items())},
+            **_action_fields(plan)))
 
     # Gate 7b: the repeat guard. People mash commands during an incident; an
     # automation that re-fires is more likely a bug than intent.
@@ -2321,18 +3396,41 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
                     % ("%ds" % age if age is not None else "recently",
                        prior.get("reason")))
             if opts["approve"]:
+                until = time.strftime("%H:%M", time.localtime(
+                    time.time() + max(0, REPEAT_WINDOW_SECONDS - (age or 0)) + 60))
                 raise Refused(
                     "%s.\n  Refusing an unattended repeat inside %ds — a script "
                     "re-firing the same mutation is more likely a bug than "
-                    "intent. Re-run interactively if you mean it."
-                    % (note, REPEAT_WINDOW_SECONDS))
+                    "intent. Re-run interactively if you mean it, or wait until "
+                    "%s. A vpsrun step: `vpsrun ... --resume` waits the window out "
+                    "for its own failed step."
+                    % (note, REPEAT_WINDOW_SECONDS, until))
             print("")
             print("  ⚠ WARNING: %s" % note)
 
+    named = [(auth.get(h) or {}).get("timeout") for h in hosts]
+    if expansions and not any(named):
+        named = [e.timeout for e in expansions.values()]  # the action's own default
     timeout, basis = choose_timeout(
-        opts["timeout"], [(auth.get(h) or {}).get("timeout") for h in hosts],
-        plan["command"], tier, int(limits.get("command_timeout_sec", 120)))
+        opts["timeout"], named, plan["command"], tier,
+        int(limits.get("command_timeout_sec", 120)))
     print("  timeout : %ds per host (%s)" % (timeout, basis))
+
+    # Grants: with no contract flag on a break-glass plan, or with --grant
+    # auto on any mutation, list every VALID grant that covers this exact plan
+    # (vpsrun reads these lines when planning a play or release). Only an
+    # explicit `--grant auto` (or --approval-contract=auto) ever USES one
+    # without naming it (H4c), and never one minted --for-release (M6). An
+    # incident and --no-grant never list or pick one. Nothing is counted or
+    # journaled here; use() re-checks the chosen grant in full.
+    explicit_auto = opts["approval_contract"] == AUTO_GRANT
+    auto = (tier != "read" and not incident and not opts["no_grant"]
+            and (explicit_auto
+                 or (opts["approval_contract"] is None and plan["break_glass"])))
+    found = (vpsexecgrant.candidates(plan, policy, aliases=aliases)
+             if auto else [])
+    if auto:
+        print(vpsexecgrant.render_candidates(found))
 
     if tier == "read":
         journal.append("vpsexec", {"event": "read", "hosts": hosts,
@@ -2350,15 +3448,41 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
     # Gates 8-10: approval, journal-or-refuse, per-host locks. An approval
     # contract replaces ONLY the typed break-glass phrase; every gate above has
     # already run unchanged. Invalid for this plan => refused, never prompted.
-    if opts["approval_contract"] is not None:
+    contract = opts["approval_contract"]
+    grant_flag = opts["grant_flag"]
+    if explicit_auto:
+        grant_flag = "%s auto" % opts["grant_flag"]
+        usable = vpsexecgrant.unbound(found)
+        if not usable:
+            raise Refused("%s: no valid grant in %s covers this plan%s — mint one "
+                          "(vpsexec grant new ...), or drop the flag to type the phrase"
+                          % (grant_flag, vpsexecgrant.GRANT_DIR,
+                             " (grants minted --for-release are spent only by their "
+                             "release)" if found else ""))
+        contract = vpsexecgrant.announce(usable, digest)
+    elif contract is None and found:
+        print("  grant   : not used — this door auto-picks only with --grant auto "
+              "(or name one: --grant FILE); the typed phrase follows")
+    if incident:
+        approval = vpsexecincident.approve(incident, stream, prompt=prompt,
+                                           hosts=hosts, digest=digest)
+        journal.append("vpsexec", {
+            "event": "incident_command", "incident": incident["incident_id"],
+            "hosts": hosts, "command": plan["command"],
+            "placement": plan["placement"],
+            "targets": dict((h, plan["per_host"][h]["targets"]) for h in hosts),
+            "tier": plan["tier"], "postures": plan["postures"],
+            "elevated": sorted(elevated), "reason": opts["reason"],
+            "plan_hash": digest, "expires_at": incident["expires_at"]})
+    elif contract is not None:
         if opts["approve"] and not plan["break_glass"]:
-            raise Refused("--approve and --approval-contract are two approvals "
+            raise Refused("--approve and %s are two approvals "
                           "for one plan — pass one (a contract only replaces the "
-                          "break-glass phrase)")
+                          "break-glass phrase)" % opts["grant_flag"])
         if opts["approve"]:
             check_plan_hash(opts["approve"], digest)
-        approval = vpsexecgrant.use(opts["approval_contract"], plan, digest, policy,
-                                    stream, aliases=aliases)
+        approval = vpsexecgrant.use(contract, plan, digest, policy,
+                                    stream, aliases=aliases, flag=grant_flag)
         if opts["approve"]:
             approval = "plan-hash+" + approval
     else:
@@ -2369,7 +3493,8 @@ def dispatch(argv, guard=None, policy=None, prober=None, ssh=None, stream=None,
             "event": "break_glass", "hosts": sorted(elevated),
             "command": plan["command"], "reason": opts["reason"],
             "runbooks": sorted(set(auth[h].get("source") or "--override"
-                                   for h in elevated if auth[h]))})
+                                   for h in elevated if auth[h])),
+            **({"incident": incident["incident_id"]} if incident else {})})
     return execute(plan, guard, opts["reason"], approval, ssh=ssh,
                    timeout=timeout, max_parallel=max_parallel,
                    stream=stream, prompt=prompt)

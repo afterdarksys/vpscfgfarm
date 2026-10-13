@@ -27,7 +27,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import test_vpsexec as tv  # noqa: E402  (module, not names: no re-collection)
-from vpscfg import probe, vpsexec, vpsexecgrant, vpsexecpolicy  # noqa: E402
+from vpscfg import gitcmd, probe, vpsexec, vpsexecgrant, vpsexecpolicy  # noqa: E402
 from vpscfg.gates import Refused  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -90,11 +90,43 @@ class _GrantHarness(tv._Harness):
         vpsexecgrant._is_controlling_tty = lambda stream: stream.isatty()
         self.policy_dir = Path(self.home.name) / "policies"
         self.policy_dir.mkdir()
+        # A reusable grant is bound to its scope files' PUSHED history (H4a):
+        # the policy dir is a real repository with a local bare "origin", and
+        # write_runbook commits and pushes to origin/main. The door refuses a
+        # local-path remote in production (protocol.file.allow=never); only
+        # this harness allows it, to stand in for the real remote.
+        self._fetch_file = gitcmd.FETCH_FILE_PROTOCOL
+        gitcmd.FETCH_FILE_PROTOCOL = "always"
+        self.origin = Path(self.home.name) / "origin.git"
+        self.git("init", "-q")
+        self.git("init", "-q", "--bare", str(self.origin))
+        self.git("remote", "add", "origin", str(self.origin))
         self.write_runbook()
+
+    def git(self, *args):
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": self.home.name,
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+               "GIT_CONFIG_NOSYSTEM": "1"}
+        r = subprocess.run(["git", "-C", str(self.policy_dir)] + list(args), env=env,
+                           capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, (args, r.stdout, r.stderr)
+        return r.stdout.strip()
+
+    def commit(self, message="policy edit", push=True):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        if push:
+            self.push()
+
+    def push(self, force=False):
+        self.git(*(["push", "-q"] + (["--force"] if force else [])
+                   + ["origin", "HEAD:refs/heads/main"]))
 
     def tearDown(self):
         (vpsexecgrant.GRANT_DIR, vpsexecgrant.KEY_PATH,
          vpsexecgrant._is_controlling_tty) = self._real
+        gitcmd.FETCH_FILE_PROTOCOL = self._fetch_file
         self.home.cleanup()
         super().tearDown()
 
@@ -102,6 +134,7 @@ class _GrantHarness(tv._Harness):
         # `steps`: a reviewed edit that adds a step updates the shape with it.
         text = (RUNBOOK % expires).replace("shape: {steps: 4,", "shape: {steps: %d," % steps)
         (self.policy_dir / "rb.yaml").write_text(text + extra)
+        self.commit()
         self.policy = vpsexecpolicy.load(
             policy_dir=self.policy_dir, deny_patterns=tv.DENY,
             governor_hosts=set(tv._policy()["hosts"]), host_re=probe.HOST_RE)
@@ -193,8 +226,9 @@ class GrantMintTest(_GrantHarness):
         self.assertEqual(os.stat(self.key_path).st_mode & 0o777, 0o600)
         self.assertEqual(len(self.key_path.read_bytes()), 32)
         g = self.load(path)
-        self.assertEqual(set(g), vpsexecgrant.TOP_KEYS)
-        self.assertRegex(g["session_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(set(g), vpsexecgrant.SHORT_KEYS)
+        self.assertEqual((g["version"], g["kind"]), (2, "short"))
+        self.assertRegex(g["session_id"], r"^st_[0-9a-f]{32}$")
         self.assertRegex(g["approval_code"], r"^[A-Z2-7]{4}-[A-Z2-7]{4}-[A-Z2-7]{4}$")
         # Rollback (3) and non-break-glass (4) are left out by default.
         self.assertEqual([s["index"] for s in g["steps"]], [1, 2])
@@ -480,8 +514,8 @@ class GrantUseTest(_GrantHarness):
         path = self.mint()
         sid = self.load(path)["session_id"]
         with contextlib.redirect_stdout(io.StringIO()):
-            vpsexecgrant.cli(["revoke", sid[:8]], self.policy, stream=_TTY(),
-                             prompt=lambda m: "REVOKE:%s" % sid[:8])
+            vpsexecgrant.cli(["revoke", vpsexecgrant.short_id(sid)], self.policy, stream=_TTY(),
+                             prompt=lambda m: "REVOKE:%s" % vpsexecgrant.short_id(sid))
         self.assertTrue([e for e in self.events() if e["event"] == "grant_revoked"
                          and e["session_id"] == sid])
         self.refuses(path, "revoked")
@@ -491,7 +525,7 @@ class GrantUseTest(_GrantHarness):
     def test_revoke_needs_tty_and_phrase(self):
         path = self.mint()
         sid = self.load(path)["session_id"]
-        for stream, typed in ((_NoTTY(), "REVOKE:%s" % sid[:8]), (_TTY(), "REVOKE:x")):
+        for stream, typed in ((_NoTTY(), "REVOKE:%s" % vpsexecgrant.short_id(sid)), (_TTY(), "REVOKE:x")):
             with self.assertRaises(Refused):
                 with contextlib.redirect_stdout(io.StringIO()):
                     vpsexecgrant.cli(["revoke", sid], self.policy, stream=stream,
@@ -584,14 +618,14 @@ class GrantIntrospectionTest(_GrantHarness):
         sid = self.load(revoked)["session_id"]
         with contextlib.redirect_stdout(io.StringIO()):
             vpsexecgrant.cli(["revoke", sid], self.policy, stream=_TTY(),
-                             prompt=lambda m: "REVOKE:%s" % sid[:8])
+                             prompt=lambda m: "REVOKE:%s" % vpsexecgrant.short_id(sid))
         rc, out = self._cli("list")
         self.assertEqual(rc, 0)
         rows = dict((line.split()[1], line.split()[0])
                     for line in out.splitlines() if line.strip())
-        self.assertEqual(rows[self.load(active)["session_id"][:8]], "ACTIVE")
-        self.assertEqual(rows[Path(expired).stem[:8]], "EXPIRED")
-        self.assertEqual(rows[sid[:8]], "REVOKED")
+        self.assertEqual(rows[vpsexecgrant.short_id(self.load(active)["session_id"])], "ACTIVE")
+        self.assertEqual(rows[vpsexecgrant.short_id(Path(expired).stem)], "EXPIRED")
+        self.assertEqual(rows[vpsexecgrant.short_id(sid)], "REVOKED")
 
     def test_grant_is_a_reserved_verb(self):
         self.assertIn("grant", vpsexec.RESERVED_VERBS)
@@ -646,7 +680,7 @@ class ReviewFixTest(_GrantHarness):
             vpsexecgrant.cli(["list"], self.policy, stream=_TTY())
         rows = [l.split()[:2] for l in out.getvalue().splitlines() if l.strip()]
         self.assertIn(["INVALID", "f" * 8], rows)
-        self.assertIn(["ACTIVE", g["session_id"][:8]], rows)
+        self.assertIn(["ACTIVE", vpsexecgrant.short_id(g["session_id"])], rows)
         # Even sealed by the key holder, a surrogate canonicalises without error.
         self.assertTrue(vpsexecgrant.canonical(g))
 
@@ -669,7 +703,7 @@ class ReviewFixTest(_GrantHarness):
         sid = self.load(path)["session_id"]
         with contextlib.redirect_stdout(io.StringIO()):
             vpsexecgrant.cli(["revoke", sid], self.policy, stream=_TTY(),
-                             prompt=lambda m: "REVOKE:%s" % sid[:8])
+                             prompt=lambda m: "REVOKE:%s" % vpsexecgrant.short_id(sid))
         fake = Path(tempfile.mkdtemp())
         (fake / ".vpscfg").mkdir(mode=0o700)
         (fake / ".vpscfg" / "grant.key").write_bytes(self.key_path.read_bytes())
@@ -818,7 +852,7 @@ class GrantPreflightTest(_GrantHarness):
         sid = g["session_id"]
         with contextlib.redirect_stdout(io.StringIO()):
             vpsexecgrant.cli(["revoke", sid], self.policy, stream=_TTY(),
-                             prompt=lambda m: "REVOKE:%s" % sid[:8])
+                             prompt=lambda m: "REVOKE:%s" % vpsexecgrant.short_id(sid))
         with self.assertRaises(Refused):
             vpsexecgrant.preflight(path)
         g["hosts"].append("web3")

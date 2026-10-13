@@ -39,6 +39,7 @@ value. (Parsing is still YAML 1.1: `yes`/`no`/`on`/`off` are booleans.)
 | `checks` | no | named read plays — `vpsexec check <name>` |
 | `deny_extra` | no | extra always-refused patterns — **absolute**, like the floor: no runbook, override, break-glass or approval lifts them |
 | `risky_extra` | no | extra tier-2 patterns |
+| `assumes` | no | what the runbooks take for granted on the hosts (container, image, env NAMES, compose labels/files, absent paths, free disk; table ownership and secret distinctness as MANUAL). Grants nothing. Checked by `vpsexec runbook preflight`; see `docs/VPSEXEC.md` |
 
 ## Runbooks
 

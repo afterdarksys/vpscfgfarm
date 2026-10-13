@@ -1,0 +1,42 @@
+{
+  "action": "install_pushed",
+  "expansions": [
+    {
+      "assumes": [],
+      "body": "set -eu\nsha='3f1c00000000000000000000000000000000000000000000000000000000a1e9'\nname='diskwatch-0.8.0'\ndest='/usr/local/bin/diskwatch'\nmode='0755'\nowner='root'\nsrc=\"/var/tmp/vpscfg-push/$sha/$name\"\nif [ -L \"$dest\" ] || [ -d \"$dest\" ]; then\n  echo \"install_pushed: $dest is a symlink or a directory; not installed\" >&2\n  exit 3\nfi\nif ! echo \"$sha  $src\" | sha256sum --check --status; then\n  echo \"install_pushed: $src is missing or does not have the approved hash; not installed\" >&2\n  exit 3\nfi\nd=${dest%/*}; [ -n \"$d\" ] || d=/\nt=$(mktemp \"$d/.vpscfg-install.XXXXXX\")\ntrap 'rm -f \"$t\"' EXIT\ninstall -m \"$mode\" -o \"$owner\" -g \"$owner\" \"$src\" \"$t\"\nif ! echo \"$sha  $t\" | sha256sum --check --status; then\n  echo \"install_pushed: the installed copy does not have the approved hash; not moved into place\" >&2\n  exit 3\nfi\nmv -fT \"$t\" \"$dest\"\necho \"installed $dest ($mode $owner)\"",
+      "canonical": "vpscfg-action install_pushed@1 '{\"basename\":\"diskwatch-0.8.0\",\"dest\":\"/usr/local/bin/diskwatch\",\"mode\":\"0755\",\"owner\":\"root\",\"sha256\":\"3f1c00000000000000000000000000000000000000000000000000000000a1e9\"}'",
+      "check": "echo '3f1c00000000000000000000000000000000000000000000000000000000a1e9' '' '/usr/local/bin/diskwatch' | sha256sum --check --status && stat -c '%a' '/usr/local/bin/diskwatch' | grep -qx '755' && stat -c '%U' '/usr/local/bin/diskwatch' | grep -qx 'root' && echo VPSCFG-DONE || echo VPSCFG-NEEDED",
+      "idempotent": true,
+      "params": {
+        "basename": "diskwatch-0.8.0",
+        "dest": "/usr/local/bin/diskwatch",
+        "mode": "0755",
+        "owner": "root",
+        "sha256": "3f1c00000000000000000000000000000000000000000000000000000000a1e9"
+      },
+      "tier": "mutation",
+      "timeout": 120,
+      "verify": "echo '3f1c00000000000000000000000000000000000000000000000000000000a1e9' '' '/usr/local/bin/diskwatch' | sha256sum --check --status && stat -c '%a' '/usr/local/bin/diskwatch' | grep -qx '755' && stat -c '%U' '/usr/local/bin/diskwatch' | grep -qx 'root'",
+      "verify_retry": null
+    },
+    {
+      "assumes": [],
+      "body": "set -eu\nsha='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'\nname='shop.conf'\ndest='/etc/shop/app.conf'\nmode='0600'\nowner='root'\nsrc=\"/var/tmp/vpscfg-push/$sha/$name\"\nif [ -L \"$dest\" ] || [ -d \"$dest\" ]; then\n  echo \"install_pushed: $dest is a symlink or a directory; not installed\" >&2\n  exit 3\nfi\nif ! echo \"$sha  $src\" | sha256sum --check --status; then\n  echo \"install_pushed: $src is missing or does not have the approved hash; not installed\" >&2\n  exit 3\nfi\nd=${dest%/*}; [ -n \"$d\" ] || d=/\nt=$(mktemp \"$d/.vpscfg-install.XXXXXX\")\ntrap 'rm -f \"$t\"' EXIT\ninstall -m \"$mode\" -o \"$owner\" -g \"$owner\" \"$src\" \"$t\"\nif ! echo \"$sha  $t\" | sha256sum --check --status; then\n  echo \"install_pushed: the installed copy does not have the approved hash; not moved into place\" >&2\n  exit 3\nfi\nmv -fT \"$t\" \"$dest\"\necho \"installed $dest ($mode $owner)\"",
+      "canonical": "vpscfg-action install_pushed@1 '{\"basename\":\"shop.conf\",\"dest\":\"/etc/shop/app.conf\",\"mode\":\"0600\",\"owner\":\"root\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}'",
+      "check": "echo 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' '' '/etc/shop/app.conf' | sha256sum --check --status && stat -c '%a' '/etc/shop/app.conf' | grep -qx '600' && stat -c '%U' '/etc/shop/app.conf' | grep -qx 'root' && echo VPSCFG-DONE || echo VPSCFG-NEEDED",
+      "idempotent": true,
+      "params": {
+        "basename": "shop.conf",
+        "dest": "/etc/shop/app.conf",
+        "mode": "0600",
+        "owner": "root",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "tier": "mutation",
+      "timeout": 120,
+      "verify": "echo 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' '' '/etc/shop/app.conf' | sha256sum --check --status && stat -c '%a' '/etc/shop/app.conf' | grep -qx '600' && stat -c '%U' '/etc/shop/app.conf' | grep -qx 'root'",
+      "verify_retry": null
+    }
+  ],
+  "version": 1
+}

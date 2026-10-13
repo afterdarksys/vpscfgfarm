@@ -12,6 +12,7 @@
     "drift",
     "verify",
     "fleet",
+    "index",
     "plan",
     "status",
     "help",

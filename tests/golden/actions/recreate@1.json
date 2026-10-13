@@ -1,0 +1,88 @@
+{
+  "action": "recreate",
+  "expansions": [
+    {
+      "assumes": [
+        {
+          "compose_files": [
+            "/srv/compose/shop.yml"
+          ],
+          "compose_labels": {
+            "com.docker.compose.project": "shopstack",
+            "com.docker.compose.project.config_files": "/srv/compose/shop.yml",
+            "com.docker.compose.project.working_dir": "/opt/shop",
+            "com.docker.compose.service": "frontend"
+          },
+          "container": "shop-web-1",
+          "host": "web1"
+        }
+      ],
+      "body": "set -eu\nc='shop-web-1'\nproject='shopstack'\nservice='frontend'\nworkdir='/opt/shop'\nf1='/srv/compose/shop.yml'\nfiles=\"$f1\"\n# The four compose labels must equal the pinned values, or nothing is recreated.\nhave=$(docker inspect --format '{{index .Config.Labels \"com.docker.compose.project\"}}|{{index .Config.Labels \"com.docker.compose.service\"}}|{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}|{{index .Config.Labels \"com.docker.compose.project.config_files\"}}' \"$c\")\nif [ \"$have\" != \"$project|$service|$workdir|$files\" ]; then\n  echo \"recreate: $c was not started from the pinned compose project, service, directory and files (found: $have); not recreated\" >&2\n  exit 3\nfi\ndocker compose -p \"$project\" --project-directory \"$workdir\" -f \"$f1\" up -d --no-deps --force-recreate --pull never \"$service\"",
+      "canonical": "vpscfg-action recreate@1 '{\"config_files\":[\"/srv/compose/shop.yml\"],\"container\":\"shop-web-1\",\"healthy\":false,\"interval\":3,\"project\":\"shopstack\",\"service\":\"frontend\",\"tries\":20,\"working_dir\":\"/opt/shop\"}'",
+      "check": null,
+      "idempotent": false,
+      "params": {
+        "config_files": [
+          "/srv/compose/shop.yml"
+        ],
+        "container": "shop-web-1",
+        "healthy": false,
+        "interval": 3,
+        "project": "shopstack",
+        "service": "frontend",
+        "tries": 20,
+        "working_dir": "/opt/shop"
+      },
+      "tier": "mutation",
+      "timeout": 300,
+      "verify": "docker inspect --format '{{.State.Running}}' 'shop-web-1' | grep -qx true",
+      "verify_retry": [
+        20,
+        3
+      ]
+    },
+    {
+      "assumes": [
+        {
+          "compose_files": [
+            "/srv/compose/base.yml",
+            "/srv/compose/prod.yml"
+          ],
+          "compose_labels": {
+            "com.docker.compose.project": "shopstack",
+            "com.docker.compose.project.config_files": "/srv/compose/base.yml,/srv/compose/prod.yml",
+            "com.docker.compose.project.working_dir": "/opt/shop",
+            "com.docker.compose.service": "backend"
+          },
+          "container": "shop-api-1",
+          "host": "web1"
+        }
+      ],
+      "body": "set -eu\nc='shop-api-1'\nproject='shopstack'\nservice='backend'\nworkdir='/opt/shop'\nf1='/srv/compose/base.yml'\nf2='/srv/compose/prod.yml'\nfiles=\"$f1,$f2\"\n# The four compose labels must equal the pinned values, or nothing is recreated.\nhave=$(docker inspect --format '{{index .Config.Labels \"com.docker.compose.project\"}}|{{index .Config.Labels \"com.docker.compose.service\"}}|{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}|{{index .Config.Labels \"com.docker.compose.project.config_files\"}}' \"$c\")\nif [ \"$have\" != \"$project|$service|$workdir|$files\" ]; then\n  echo \"recreate: $c was not started from the pinned compose project, service, directory and files (found: $have); not recreated\" >&2\n  exit 3\nfi\ndocker compose -p \"$project\" --project-directory \"$workdir\" -f \"$f1\" -f \"$f2\" up -d --no-deps --force-recreate --pull never \"$service\"",
+      "canonical": "vpscfg-action recreate@1 '{\"config_files\":[\"/srv/compose/base.yml\",\"/srv/compose/prod.yml\"],\"container\":\"shop-api-1\",\"healthy\":true,\"interval\":5,\"project\":\"shopstack\",\"service\":\"backend\",\"tries\":30,\"working_dir\":\"/opt/shop\"}'",
+      "check": null,
+      "idempotent": false,
+      "params": {
+        "config_files": [
+          "/srv/compose/base.yml",
+          "/srv/compose/prod.yml"
+        ],
+        "container": "shop-api-1",
+        "healthy": true,
+        "interval": 5,
+        "project": "shopstack",
+        "service": "backend",
+        "tries": 30,
+        "working_dir": "/opt/shop"
+      },
+      "tier": "mutation",
+      "timeout": 300,
+      "verify": "docker inspect --format '{{.State.Health.Status}}' 'shop-api-1' | grep -qx healthy",
+      "verify_retry": [
+        30,
+        5
+      ]
+    }
+  ],
+  "version": 1
+}

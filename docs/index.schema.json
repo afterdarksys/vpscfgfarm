@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vpscfg-host-index-v1",
+  "title": "vpscfg host index, index_version 1",
+  "description": "One host's index as written by `vpscfg index <host>` to <estate>/index/<host>.json. Every section is either its data, {\"error\": ...} (the read broke) or {\"unavailable\": ...} (a gate refused to send the read). Names and counts only: no secret values. See docs/INDEX.md.",
+  "type": "object",
+  "required": ["index_version", "collected_at", "host", "sections"],
+  "properties": {
+    "index_version": {"const": 1},
+    "collected_at": {"type": "string", "description": "UTC, YYYY-MM-DDTHH:MM:SSZ"},
+    "host": {"type": "string"},
+    "sections": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": {"$ref": "#/$defs/section", "description": "hostname, os{pretty_name,id,version_id}, kernel, arch, uptime_seconds, cpus, memory{total_bytes,available_bytes}, disks[{filesystem,mount,size_bytes,used_bytes,available_bytes}]"},
+        "services": {"$ref": "#/$defs/section", "description": "units[{name,load,active,sub,enabled}]"},
+        "containers": {"$ref": "#/$defs/section", "description": "docker{server_version}|null, containers[{name,image,image_id,state,compose{project,service,config_files[],working_dir},networks[],published[{proto,host_ip,host_port,container_port}],env_names[]}], skipped[], k3s{workloads[{kind,namespace,name,ready,desired,images[]}]}|{error}|null"},
+        "ports": {"$ref": "#/$defs/section", "description": "listeners[{proto,address,port,process,pid,container}]"},
+        "users": {"$ref": "#/$defs/section", "description": "users[{name,uid,gid,home,shell,login,groups[],sudo}], groups[{name,gid,members[]}], sudo_users[]"},
+        "postgres": {"$ref": "#/$defs/engine", "description": "instances[{id,source,container|unit,image,version,in_recovery,roles[{name,superuser,login,replication,createdb,createrole,inherit,member_of[]}],databases_truncated}], databases[{name,instance,owner,encoding,allow_connections,size_bytes,schemas[{name,owner,ownership[{owner,kind,count}],tables[{name,owner}],tables_truncated?}]|schemas_unavailable|error}]"},
+        "redis": {"$ref": "#/$defs/engine", "description": "instances[{id,source,container|unit,image,version,role,connected_replicas,keyspace[{db,keys,expires}],memory{used_bytes,used_human,max_bytes}}]"},
+        "rabbitmq": {"$ref": "#/$defs/engine", "description": "instances[{id,source,container|unit,image,vhosts[{name,queues[{name,messages,consumers}],exchanges[{name,type}]}]}]"},
+        "web": {"$ref": "#/$defs/section", "description": "file, routers[{name,hostnames[],service,backends[]}]"}
+      }
+    }
+  },
+  "$defs": {
+    "failed": {
+      "oneOf": [
+        {"type": "object", "required": ["error"], "properties": {"error": {"type": "string"}}},
+        {"type": "object", "required": ["unavailable"], "properties": {"unavailable": {"type": "string"}}}
+      ]
+    },
+    "section": {"type": "object"},
+    "engine": {
+      "type": "object",
+      "anyOf": [
+        {"$ref": "#/$defs/failed"},
+        {
+          "required": ["present", "instances"],
+          "properties": {
+            "present": {"type": "boolean"},
+            "detection_incomplete": {"type": "string"},
+            "instances": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "source"],
+                "properties": {
+                  "id": {"type": "string", "description": "container:<name> or host:<unit>"},
+                  "source": {"enum": ["container", "host"]},
+                  "error": {"type": "string"},
+                  "unavailable": {"type": "string"}
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

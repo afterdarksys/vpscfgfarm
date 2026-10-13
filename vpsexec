@@ -337,12 +337,38 @@ def judge(policy, argv):
         return {"verb": "exec", "hosts": [], "read_only": True,
                 "break_glass": False, "introspect": argv[0]}
 
+    # `reconcile <host>` releases a retained per-host lock: the door's own
+    # bookkeeping, not a change to a service, so posture does not gate it (a
+    # break-glass step is what took the lock). It is still judged as a
+    # mutation here (master switch, mode, journal-or-refuse); the package
+    # demands a real TTY, shows the evidence and asks for a typed phrase.
+    # `reconcile <host> --stop` signals the op's step(s) (STOP:<host>:<op8>),
+    # judged the same way; it is the only flag.
+    if argv[0] == "reconcile":
+        if not policy["mutation_enabled"]:
+            refuse("mutation_enabled is false — the master switch is off")
+        if policy["mode"] == "lockdown":
+            refuse("mode is 'lockdown' — no mutations in lockdown")
+        if (len(argv) not in (2, 3) or argv[1].startswith("-") or argv[1].startswith("@")
+                or (len(argv) == 3 and argv[2] != "--stop")):
+            refuse("usage: vpsexec reconcile <host> [--stop]   (one host)")
+        return {"verb": "exec", "hosts": resolve_hosts(argv[1], policy, {}),
+                "read_only": False, "break_glass": False, "introspect": "reconcile"}
+
     # `grant ...` mints, lists, shows or revokes an approval contract: a local
     # file under ~/.vpscfg, never a host. Using one is a normal mutation and
     # gets judged as one; minting needs a TTY and a typed phrase in the package.
     if argv[0] == "grant":
         return {"verb": "exec", "hosts": [], "read_only": True,
                 "break_glass": False, "introspect": "grant"}
+
+    # `incident open|close|status` is the same kind of local file under
+    # ~/.vpscfg: TTY plus a typed phrase in the package, never a host. A
+    # command run UNDER an incident is an ordinary mutation and is judged below
+    # (--break-glass still needed for a frozen host at this door).
+    if argv[0] == "incident":
+        return {"verb": "exec", "hosts": [], "read_only": True,
+                "break_glass": False, "introspect": "incident"}
 
     # `check <name>` runs a named READ play. The package re-enters its own
     # dispatch with the command spelled out, so every gate still applies; this
@@ -352,6 +378,14 @@ def judge(policy, argv):
             refuse("`vpsexec check` runs reads only — --run is meaningless here")
         return {"verb": "exec", "hosts": [], "read_only": True,
                 "break_glass": False, "introspect": "check"}
+
+    # `runbook lint|preflight <file>` reads a local policy file and, for
+    # preflight, sends fixed reads that the package classifies like any other.
+    if argv[0] == "runbook":
+        if "--run" in argv:
+            refuse("`vpsexec runbook` only reads — --run is meaningless here")
+        return {"verb": "exec", "hosts": [], "read_only": True,
+                "break_glass": False, "introspect": "runbook"}
 
     spec = argv[0] if not argv[0].startswith("-") else None
     hosts = resolve_hosts(spec, policy, load_groups()) if spec else []

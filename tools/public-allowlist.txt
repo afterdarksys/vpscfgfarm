@@ -43,6 +43,10 @@ docs/REPAIR-PROTOCOL.md
 docs/SECURITY-TOOLING.md
 docs/STABILITY.md
 docs/VPSEXEC.md
+docs/ACTIONS.md
+docs/INDEX.md
+docs/index.schema.json
+docs/WORKLOAD-DRAFT.md
 policies/README.md
 plays/README.md
 overrides/example.override.yml

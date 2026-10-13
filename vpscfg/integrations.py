@@ -11,7 +11,8 @@ vpscfg/estate.py) may carry a top-level "integrations" mapping:
                     "unit": "lockdown.service",
                     "installer": "the firewall manager's installer"},
       "blackout":  {"file": "/var/lib/maintenance/active-windows.json"},
-      "secret_source": {"command": ["keystore", "pipe", "--"]}
+      "secret_source": {"command": ["keystore", "pipe", "--"]},
+      "notify":    {"command": ["/usr/local/bin/push-note", "--quiet"]}
     }
 
 Each one is OFF when the governor does not name it:
@@ -26,6 +27,8 @@ Each one is OFF when the governor does not name it:
                is missing. Unset never reads as "inside a window".
   - secret_source: `secret-put --from-pipe` refuses: there is no command to
                read a secret from.
+  - notify:    vpsrun tells no one when a play or release halts, finishes or
+               leaves a host lock retained (vpscfg/notify.py sends nothing).
 
 Nothing else can set them: no environment variable, flag, working directory
 or $HOME is read here. The telemetry credential is the one exception that
@@ -55,7 +58,7 @@ from .gates import Refused
 
 KEY = "integrations"
 KNOWN = {"telemetry": ("url",), "traefik": ("host", "file"), "firewall": ("desired_state", "script", "unit", "installer"),
-         "blackout": ("file",), "secret_source": ("command",)}
+         "blackout": ("file",), "secret_source": ("command",), "notify": ("command",)}
 
 _URL_RE = re.compile(r"^https://[A-Za-z0-9.-]{1,253}(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~-]*)*\Z")
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,253}\Z")
@@ -271,4 +274,23 @@ def secret_source(governor=None):
         raise Refused("governor %s.secret_source.command must be a non-empty argv list "
                       "of plain words ([A-Za-z0-9_./=:@+-]); its first word a command "
                       "name or an absolute, normalised path" % KEY)
+    return list(argv)
+
+
+def notify_command(governor=None):
+    """argv (a list) of the local command vpsrun runs to tell a human that a
+    play or release halted, finished or left a lock retained, or None (off).
+    vpscfg/notify.py appends the event name and writes the event as JSON on
+    its stdin; it is run without a shell, with a minimal environment. Its
+    first word must be an ABSOLUTE path (L3): PATH never chooses it."""
+    cfg = section("notify", governor)
+    if cfg is None:
+        return None
+    argv = cfg["command"]
+    if not isinstance(argv, list) or not argv or len(argv) > 16 \
+            or not all(isinstance(a, str) and _ARGV_RE.match(a) for a in argv) \
+            or not _abs_path(argv[0]):
+        raise Refused("governor %s.notify.command must be a non-empty argv list "
+                      "of plain words ([A-Za-z0-9_./=:@+-]); its first word an "
+                      "absolute, normalised path (PATH never picks the notifier)" % KEY)
     return list(argv)

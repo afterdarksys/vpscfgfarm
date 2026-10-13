@@ -125,7 +125,7 @@ VALID_POSTURES = ("frozen", "lockdown", "test", "released")
 READ_ONLY_VERBS = frozenset(
     ["show", "details", "containers", "services", "overlays",
      "drift", "verify", "fleet", "plan", "status", "help", "lint", "journal", "ports",
-     "backup-verify", "map", "logs", "sql"]
+     "backup-verify", "map", "logs", "sql", "index"]
 )
 
 
@@ -225,12 +225,13 @@ def judge(policy: dict, argv: list) -> dict:
     if not argv:
         return {"verb": "help", "read_only": True}
 
-    # Grammar: vpscfg <host> <verb> [...] | vpscfg module ... | vpscfg fleet ...
+    # Grammar: vpscfg <host> <verb> [...] | vpscfg module|fleet|index ...
     first = argv[0]
-    if first in ("module", "fleet"):
-        # The group word IS the verb; subactions (fleet hosts, module register)
-        # are judged inside the package. 'fleet' is read-only; 'module' is not
-        # in allowed_verbs in v0, so it refuses here — correctly.
+    if first in ("module", "fleet", "index"):
+        # The group word IS the verb; subactions (fleet hosts, module register,
+        # index diff) are judged inside the package. 'fleet' and 'index' are
+        # read-only; 'module' is not in allowed_verbs in v0, so it refuses
+        # here — correctly.
         target_host, verb = None, first
     else:
         target_host, verb = first, (argv[1] if len(argv) > 1 else "show")

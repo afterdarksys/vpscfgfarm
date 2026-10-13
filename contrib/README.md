@@ -14,6 +14,7 @@ estate directory that `estate.path` names.
 | `example-estate/` | A fictional three-host estate: a governor, ssh stanzas, a groups file, a checks file, a credential-path deny list and one release runbook with its artifact |
 | `runbook-walker/walk.sh` | Runs the steps of one runbook in order, each through `vpsexec` |
 | `runbook-walker/deploy.sh` | Mints one approval contract for a runbook, then runs `walk.sh` under it |
+| `index-schedule/` | Templates (launchd agent; systemd service and timer) that run `vpscfg index --all` every 12 hours. Not installed by anything; see [docs/INDEX.md](../docs/INDEX.md) |
 
 `tests/test_contrib.py` loads the example with the real policy loader and runs
 the walker's `--list` mode, so the example cannot drift out of step with the

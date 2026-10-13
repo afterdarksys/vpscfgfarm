@@ -21,19 +21,32 @@ vpscfg/
   iacgate.py           badfarm static IaC scan of a local path: preflight `iac` check
                        and `fleet iac`; never --repo (PREFLIGHT.md)
   vpsexec.py           separately governed ad-hoc fleet command execution
+  actions/             typed actions: typed params, pure expansion, the reserved
+                       canonical string, the expands: digest (ACTIONS.md)
+  runbookcheck.py      `vpsexec runbook lint|preflight`: runbook checks at authoring
+                       time; preflight sends fixed reads only (VPSEXEC.md)
   commandtext.py       preserves literal arguments and command boundaries
   readpolicy.py        positive option grammars for automatic read execution
   cli.py               the vpscfg command grammar: reads → probe, mutations → executor
   probe.py             read-only ssh observation; fixed command strings only
   secretmask.py        masks secret values in remote output before display/journal
+  hostindex.py         read-only host index: services, containers, ports, users,
+                       postgres/redis/rabbitmq contents, traefik routers (INDEX.md)
+  indexstore.py        the index cache (<estate>/index/), diff and query (INDEX.md)
   contracts.py         desired-state loading + validation (sync.never required)
   journal.py           locked, fsynced, hash-chained JSONL; failures block mutation
   lock.py              operation-owned host lock; uncertain/partial deploys retain it
+  detach.py            vpsexec mutation steps run detached in /run/vpscfg-ops/<op>/,
+                       each in its own process group; re-attach after a drop;
+                       evidence for `vpsexec reconcile` (and its --stop)
+  gitcmd.py            git as the doors run it: pinned binary, minimal env, no
+                       global config or fsmonitor (reusable grants, index cache)
 vpsexec                the fleet command door (outer): host groups, tiers, break-glass
 vpsrun                 the queue runner: a human approves a queued play once (plays/README.md)
 policies/              vpsexec policy files (estate; only README.md ships)
 contracts/             one YAML per service (estate)
 inventory/             probe snapshots and fingerprint baselines (estate, generated)
+index/                 cached host indexes, <host>.json + <host>.prev.json (estate, generated, gitignored)
 contrib/example-estate a complete fictional estate to start from
 journal/               control.jsonl / executor.jsonl / vpsexec.jsonl (gitignored, machine-local)
 tests/                 unit, refusal, concurrency and local filesystem integration tests
@@ -64,6 +77,7 @@ See [RECOVERY.md](RECOVERY.md) for interrupted execution and release checks.
 | [STABILITY.md](STABILITY.md) | The release ratchet: how controls come off, in order |
 | [DESIGN.md](DESIGN.md) | The contract → plan → gate → apply → verify pipeline |
 | [VPSEXEC.md](VPSEXEC.md) | The fleet command door: tiers, policy, break-glass, grants, push |
+| [ACTIONS.md](ACTIONS.md) | Typed actions: the declarative step vocabulary and its contract |
 | [MAPFILE.md](MAPFILE.md) | `.vpscfgfarm.map`: a per-directory baseline and leash (tightens only) |
 | [PREFLIGHT.md](PREFLIGHT.md) | The read-only go/no-go a deploy must pass first |
 | [K3S-APPLY.md](K3S-APPLY.md) | Deploying a k3s workload through the door |
@@ -72,3 +86,4 @@ See [RECOVERY.md](RECOVERY.md) for interrupted execution and release checks.
 | [RECOVERY.md](RECOVERY.md) | Interrupted execution, retained locks, release checks |
 | [REPAIR-PROTOCOL.md](REPAIR-PROTOCOL.md) | The versioned machine interface for an external repair client |
 | [WORKLOAD-DRAFT.md](WORKLOAD-DRAFT.md) | Draft-only compose and Deployment translation |
+| [INDEX.md](INDEX.md) | `vpscfg index`: a cached, queryable record of what lives on each host |

@@ -103,7 +103,10 @@ class VpsrunTest(unittest.TestCase):
         runs = [c for c in door.calls if "--run" in c]
         self.assertEqual([c[-1] for c in runs], ["--approve=" + H1, "--approve=" + H2])
         self.assertIn("--override=overrides/x.yaml", runs[0])
-        self.assertIn("OPS-9 stop the lease leak — step 1: stop a", runs[0])
+        # The run id rides in the reason, so the door's journal says which run
+        # made each attempt (the guard-aware retry reads it back).
+        self.assertRegex(runs[0][runs[0].index("--reason") + 1],
+                         r"^OPS-9 stop the lease leak — step 1: stop a \[run r_[0-9a-f]{16}\]$")
         plans = [c for c in door.calls if "--run" not in c]
         self.assertEqual([p[p.index("--reason") + 1] for p in plans],
                          [r[r.index("--reason") + 1] for r in runs])

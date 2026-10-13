@@ -113,6 +113,33 @@ def parse_process_owners(ss_output):
     return out
 
 
+_PID_RE = re.compile(r'users:\(\("[^"]+",pid=(\d+)')
+
+
+def parse_listeners(ss_output):
+    """`ss -lntup` -> [{proto, address, port, process, pid}], one entry per
+    socket line, sorted. The host index's ports section; process and pid are
+    None where the kernel did not attribute the socket."""
+    out = []
+    for line in ss_output.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        proto = parts[0].lower().rstrip("6")
+        if proto not in ("tcp", "udp"):
+            continue
+        for token in parts[3:6]:
+            m = re.match(r"^(.*):(\d{1,5})$", token)
+            if m:
+                pm, pid = _PROC_RE.search(line), _PID_RE.search(line)
+                out.append({"proto": proto, "address": m.group(1).strip("[]"),
+                            "port": int(m.group(2)),
+                            "process": pm.group(1) if pm else None,
+                            "pid": int(pid.group(1)) if pid else None})
+                break
+    return sorted(out, key=lambda e: (e["proto"], e["port"], e["address"]))
+
+
 def audit(listening, contracts_by_service, owners=None):
     """Compare kernel truth against declarations across one host's contracts.
     `owners` (from parse_process_owners) is optional; when present it maps each

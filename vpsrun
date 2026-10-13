@@ -12,7 +12,14 @@ twice: once without --run to get its plan and plan-hash, then with
 `--run --approve=<that hash>`. A step whose plan is break-glass also gets
 `--approval-contract=FILE` (a grant from `vpsexec grant new`): --approve alone
 no longer approves break-glass, so without a contract covering every
-break-glass step the play refuses UP FRONT, before any step runs. Every gate (floor, secrets, posture, runbooks,
+break-glass step the play refuses UP FRONT, before any step runs. With no
+contract flag (or `--approval-contract=auto` / `--grant auto`) vpsrun picks ONE
+grant for the whole play from those the door listed as valid for every
+break-glass step's plan (short before reusable, then soonest-expiring, then
+lowest id; a reusable one needs a use left per step; never a grant minted
+`--for-release` for another release, and a play never picks one at all),
+prints and journals it, and passes it explicitly to those steps (plain
+vpsexec auto-picks only with --grant auto). Every gate (floor, secrets, posture, runbooks,
 break-glass, locks, journal) runs exactly as for a hand-typed command. The
 phrase replaces typing each step's own phrase; it does not replace any gate.
 
@@ -39,6 +46,69 @@ Threats:
   - Does NOT protect against: an agent that can already pass --approve itself.
     The TTY requirement keeps vpsrun a human tool; the boundary is still the
     door, not this file.
+
+Releases, resume and the repeat guard (`vpsrun release NAME`, `--resume`):
+a release (releases/NAME.yaml) is plays in order. Every step of every play is
+planned and shown, and ONE phrase approves exactly those plans. Each run has
+a run id, carried in every step's --reason and journaled (stream `vpsrun`)
+per step. `--resume` continues the latest unfinished run of the same play or
+release: a step whose exact plan already succeeded in that run is skipped,
+everything else runs — except a step that reached the door. That one is
+settled from the door's journal by the plan-hash its start recorded (never
+its new plan): if it now plans differently, resume refuses ("changed after it
+reached the door"); if its outcome is uncertain (lost contact, a retained
+lock, or no mutation_complete at all), resume refuses and names `vpsexec
+reconcile <host>` until each host is settled by a `reconciled` (or
+`reconcile_free`) record — or, when the door died mid-way through a multi-host
+attempt, by the door's own `host_done` record for that host (written only after
+its every step, its verify and its lock release; a per-step record never
+settles a host). Then, per host: completed (COMPLETED rc=0, verify passed or
+none, or reported ok by the door) on EVERY host — not re-run by default: the
+human types SKIP-DONE:<play>:<n> (journaled done, settled_from=reconcile|door,
+the prompt naming per host which) or RERUN:<play>:<n>; completed on SOME hosts only —
+only RERUN:<play>:<n> is accepted (the step runs again on all its hosts, the
+completed ones named in the prompt), anything else refuses; completed nowhere
+— it re-runs. A step whose door refusal is ONLY the identical-plan
+guard, where every attempt the door saw in its window is this run's own
+failed attempt at this very step, waits out the window with a countdown and
+is retried once; any other run's identical plan still refuses.
+
+A release re-plans each play at its boundary (after its hold) and asks a
+REPLAN:<play>:... phrase over the new plan-hashes if any changed. A grant it
+has the door mint is narrowed (--hosts, --max-uses = its break-glass steps),
+bound --for-release, and revoked when the release completes. Refusals and
+Ctrl-C reach the notifier too; a long step prints "still running" progress.
+
+Threats (releases, resume, guard retry):
+  - Protects against: resume re-running a non-idempotent step (a step is
+    skipped only when the journal of THIS run says its exact plan-hash
+    succeeded at that position, or a human typed SKIP-DONE over a reconcile
+    that found it COMPLETED rc=0; a position that succeeded with a different
+    plan refuses the resume rather than guess; an attempt whose outcome was
+    never recorded is settled from the door's own journal by the plan-hash
+    that attempt carried, and refuses when the door's journal cannot settle
+    it, or when the step now plans differently); resume skipping a failed step
+    (only `ok`/`skipped` records skip; a failed or unrecorded step runs);
+    resume re-running an uncertain step blind (it refuses until reconcile has
+    journaled every host); an unrelated reconcile settling a step (it must
+    name the attempt's operation id or carry this step's run reason); a step
+    that completed on some hosts being re-run there silently (mixed outcomes
+    need an explicit RERUN naming those hosts);
+    the guard retry laundering someone else's repeat (it fires only when the
+    door's mutation_attempt records for this plan inside the window ALL carry
+    this run's exact step reason and this run's journal shows that step
+    failed; it waits the window out and asks the door again, so the door's
+    guard still decides); one phrase approving plans it did not show (the
+    phrase carries the count and a tag over exactly the plan-hashes that will
+    run, and each step is run with its own --approve=<hash>); a conditional
+    step matching its own command text (`when:` regexes see only the remote
+    output block the door prints, not the plan).
+  - Does NOT protect against: a same-user process editing the `vpsrun`
+    journal stream to make resume skip a step (the stream is hash-chained and
+    `vpscfg journal verify` detects it, but vpsrun does not verify the chain
+    before every resume); plans that drift between being shown and being run
+    because an EARLIER step changed live state (the door refuses the stale
+    plan-hash and the release halts; --resume re-plans and asks again).
 """
 import os
 import sys
@@ -81,8 +151,10 @@ if __name__ == "__main__" and not sys.flags.isolated:
 import hashlib
 import json
 import re
+import secrets
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 REPO = Path(os.path.realpath(__file__)).parent
@@ -93,6 +165,17 @@ sys.path.insert(0, str(REPO))
 from vpscfg import estate as _estate  # noqa: E402
 
 PLAY_DIR = _estate.root() / "plays"
+RELEASE_DIR = _estate.root() / "releases"
+# vpsrun's own per-step record of each run (resume reads it back).
+RUN_STREAM = "vpsrun"
+RUN_ID_RE = re.compile(r"^r_[0-9a-f]{16}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+STEP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+WHEN_RE = re.compile(r"^([A-Za-z0-9_-]{1,32}) reports (.+)$")
+# The door's identical-plan refusal (vpsexec dispatch, gate 7b).
+GUARD_TEXT = "Refusing an unattended repeat"
+# A conditional step's regex sees at most this much remote output.
+WHEN_MAX_CHARS = 1024 * 1024
 VPSEXEC = [_PYTHON, "-I", str(REPO / "vpsexec")]
 DIGEST_RE = re.compile(r"--approve=([0-9a-f]{64})\b")
 # render_plan() prints these; vpsrun reads the door's own resolution of each
@@ -100,9 +183,23 @@ DIGEST_RE = re.compile(r"--approve=([0-9a-f]{64})\b")
 BREAK_GLASS_RE = re.compile(r"^\s*BREAK-GLASS: \d+ of \d+ host", re.M)
 PLAN_HOSTS_RE = re.compile(r"^PLAN — \d+ hosts?: (.+)$", re.M)
 PLAN_CMD_RE = re.compile(r"^  command : (.*)$", re.M)
+# The door lists the VALID grants covering a break-glass plan (auto-pick
+# order) under a `  grants  :` header; vpsrun only chooses among those ids and
+# the door re-checks the chosen grant in full at every step.
+GRANTS_HEAD = "  grants  : "
+GRANT_LINE_RE = re.compile(
+    r"^ {12}((?:st_|ru_)?[0-9a-f]{32}) (short|reusable) until "
+    r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) code ([A-Z2-7]{4}-[A-Z2-7]{4}-[A-Z2-7]{4})"
+    r"(?: uses-left (\d+))?(?: release ([A-Za-z0-9][A-Za-z0-9._-]{0,63}))?$")
+KIND_ORDER = ("short", "reusable")  # narrower first, as the door ranks them
+AUTO = "auto"  # `--approval-contract=auto` / `--grant auto`: same as omitting it
 # Flags a step may carry. Approval, --run and --reason belong to vpsrun alone.
 STEP_FLAGS = ("--override=", "--in=", "--in-match=", "--verify=", "--break-glass",
               "--canary", "--canary=", "--timeout=", "--require-blackout")
+# A typed action (docs/ACTIONS.md) owns its placement and verify: --in=,
+# --in-match= and --verify= are the door's own refusal there too.
+ACTION_STEP_FLAGS = ("--override=", "--break-glass", "--canary", "--canary=",
+                     "--timeout=", "--require-blackout")
 # A read step has nothing to elevate, verify, canary or override.
 READ_STEP_FLAGS = ("--in=", "--in-match=", "--timeout=")
 # The FIRST tier line is the door's plan; anything later is remote output.
@@ -116,8 +213,14 @@ VPSCFG = [_PYTHON, "-I", str(REPO / "vpscfg-control.py")]
 # Any control character (C0, DEL, C1) in text shown to the approving human
 # could clear the screen or rewrite a plan already printed. Refused at load.
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-STEP_KEYS = {"hosts", "cmd", "why", "flags", "push", "sha256"}
+STEP_KEYS = {"hosts", "cmd", "why", "flags", "push", "sha256", "id", "when",
+             "action", "with"}
+# A `with:` JSON object the door's own --with ceiling accepts (docs/ACTIONS.md).
+WITH_JSON_MAX = 8192
+ACTION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}(?:@[1-9][0-9]{0,5})?$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+# The door names the release valve when a step retains or meets a held lock.
+RECONCILE_RE = re.compile(r"vpsexec reconcile ([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 
 class Refused(Exception):
@@ -163,32 +266,100 @@ def load_play(path):
         if unknown:
             raise Refused("step %d: unknown key(s) %r" % (n, unknown))
         is_push = "push" in s
+        is_action = "action" in s or "with" in s
+        if sum((is_push, is_action, "cmd" in s)) > 1:
+            raise Refused("step %d: exactly one of cmd:, push: or action:+with:" % n)
         if is_push and ("cmd" in s or not SHA_RE.match(str(s.get("sha256", "")))):
             raise Refused("step %d: a push step names push + sha256 (64 hex) and no cmd" % n)
         if not is_push and "sha256" in s:
             raise Refused("step %d: sha256 belongs to a push step" % n)
-        for key in ("hosts", "push" if is_push else "cmd", "why"):
-            if not str(s.get(key) or "").strip():
-                raise Refused("step %d: missing %r" % (n, key))
-            _clean("step %d %s" % (n, key), s[key])
+        if is_action:
+            action_name = _clean("step %d action" % n, s.get("action") or "")
+            if not ACTION_NAME_RE.match(action_name):
+                raise Refused("step %d: action %r must be [a-z][a-z0-9_]{0,31}, "
+                              "optionally @VERSION" % (n, action_name))
+            with_value = s.get("with", {}) if "with" in s else {}
+            if with_value is None:
+                with_value = {}
+            if not isinstance(with_value, dict):
+                raise Refused("step %d: with: must be a mapping, not %s"
+                              % (n, type(with_value).__name__))
+            if len(json.dumps(with_value)) > WITH_JSON_MAX:
+                raise Refused("step %d: with: is over %d bytes" % (n, WITH_JSON_MAX))
+        key = "push" if is_push else ("action" if is_action else "cmd")
+        for req in ("hosts", key, "why"):
+            if not str(s.get(req) or "").strip():
+                raise Refused("step %d: missing %r" % (n, req))
+            _clean("step %d %s" % (n, req), s[req])
+        if not is_push and not is_action:
+            from vpscfg import actions
+            if actions.is_reserved(s["cmd"]):
+                raise Refused(str(actions.reserved_refusal("step %d cmd" % n)))
         flags = [_clean("step %d flag" % n, f) for f in (s.get("flags") or [])]
+        allowed_flags = ACTION_STEP_FLAGS if is_action else STEP_FLAGS
         for f in flags:
             if not any(f == allowed or (allowed.endswith("=") and f.startswith(allowed))
-                       for allowed in STEP_FLAGS):
-                raise Refused("step %d: flag %r is not allowed in a play (allowed: %s)"
-                              % (n, f, ", ".join(STEP_FLAGS)))
+                       for allowed in allowed_flags):
+                raise Refused("step %d: flag %r is not allowed in a %sstep (allowed: %s)"
+                              % (n, f, "typed-action " if is_action else "",
+                                 ", ".join(allowed_flags)))
         if is_push:
             out.append({"hosts": str(s["hosts"]), "push": str(s["push"]),
                         "sha256": str(s["sha256"]), "why": str(s["why"]), "flags": flags,
                         "cmd": "push %s" % s["push"]})
+        elif is_action:
+            out.append({"hosts": str(s["hosts"]), "action": action_name,
+                        "with": with_value, "why": str(s["why"]), "flags": flags})
         else:
             out.append({"hosts": str(s["hosts"]), "cmd": str(s["cmd"]),
                         "why": str(s["why"]), "flags": flags})
+        _step_condition(out, n, s)
     precheck = doc.get("precheck") or []
     if not isinstance(precheck, list) or any(p not in PRECHECKS for p in precheck):
         raise Refused("%s: precheck must be a list drawn from %s" % (path, sorted(PRECHECKS)))
     return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(),
             "reason": reason, "steps": out, "precheck": list(precheck)}
+
+
+def _step_condition(out, n, raw):
+    """`id:` names a step; `when: "<earlier id> reports <regex>"` makes a step
+    optional: it runs only if that earlier step's remote output matches."""
+    step = out[-1]
+    if "id" in raw:
+        sid = _clean("step %d id" % n, raw["id"])
+        if not STEP_ID_RE.match(sid):
+            raise Refused("step %d: id %r must be 1-32 of [A-Za-z0-9_-]" % (n, sid))
+        if any(o.get("id") == sid for o in out[:-1]):
+            raise Refused("step %d: id %r is already used by an earlier step" % (n, sid))
+        step["id"] = sid
+    if "when" in raw:
+        text = _clean("step %d when" % n, raw["when"]).strip()
+        m = WHEN_RE.match(text)
+        if not m:
+            raise Refused("step %d: when must read '<earlier step id> reports <regex>'" % n)
+        ref = [k for k, o in enumerate(out[:-1], 1) if o.get("id") == m.group(1)]
+        if not ref:
+            raise Refused("step %d: when names %r, which is not the id of an EARLIER "
+                          "step in this play" % (n, m.group(1)))
+        try:
+            re.compile(m.group(2))
+        except re.error as e:
+            raise Refused("step %d: when regex %r does not compile (%s)" % (n, m.group(2), e))
+        step["when"] = {"id": m.group(1), "step": ref[0], "regex": m.group(2)}
+
+
+def remote_output(out):
+    """Only what the hosts printed: the block between the door's first
+    `───── host ─────` header and its last `SUMMARY — ` line. The plan above
+    it echoes the command, so a regex must never see it."""
+    lines = out.splitlines()
+    start = [i for i, l in enumerate(lines) if l.startswith("───── ")]
+    if not start:
+        return ""
+    end = [i for i, l in enumerate(lines) if l.startswith("SUMMARY — ")]
+    stop = end[-1] if end and end[-1] > start[0] else len(lines)
+    body = [l for l in lines[start[0]:stop] if not l.startswith("───── ")]
+    return "\n".join(body)[:WHEN_MAX_CHARS]
 
 
 def read_steps(play, classify=None):
@@ -205,38 +376,60 @@ def read_steps(play, classify=None):
     for n, s in enumerate(play["steps"], 1):
         if "push" in s:
             continue  # always a mutation; vpsexec checks the file and its hash
-        try:
-            tier = classify(s["cmd"])
-        except Exception as e:  # refused outright: say so now, not mid-play
-            raise Refused("step %d refused by the classifier: %s" % (n, e))
+        if "action" in s:
+            # The tier is fixed in code per action (docs/ACTIONS.md): no host
+            # or param data changes it, so this needs no host and no door call.
+            from vpscfg import actions
+            try:
+                tier = actions.get(s["action"], "step").tier
+            except Exception as e:
+                raise Refused("step %d refused: %s" % (n, e))
+        else:
+            try:
+                tier = classify(s["cmd"])
+            except Exception as e:  # refused outright: say so now, not mid-play
+                raise Refused("step %d refused by the classifier: %s" % (n, e))
         if tier == "read":
+            label = s.get("cmd") or "action %s" % s["action"]
             extra = [f for f in s["flags"] if not f.startswith(READ_STEP_FLAGS)]
             if extra:
                 raise Refused("step %d (%s) is a read; a read step may carry only "
-                              "%s, not %s" % (n, s["cmd"], ", ".join(READ_STEP_FLAGS),
+                              "%s, not %s" % (n, label, ", ".join(READ_STEP_FLAGS),
                                               ", ".join(extra)))
             reads.add(n)
     return reads
 
 
-def read_tag(play, n, step):
+def read_tag(play, n, step, run_id=None):
     """Stands in for a plan-hash in the play phrase: binds the read as shown."""
-    return hashlib.sha256(("read\0" + "\0".join(step_argv(play, n, step)))
+    return hashlib.sha256(("read\0" + "\0".join(step_argv(play, n, step, run_id)))
                           .encode("utf-8")).hexdigest()
 
 
-def step_reason(play, n, step):
-    return "%s — step %d: %s" % (play["reason"], n, step["why"])
+def step_reason(play, n, step, run_id=None):
+    """The run id rides in the reason, so the door's own journal says which
+    run made each attempt (the guard-aware retry reads it back)."""
+    base = "%s — step %d: %s" % (play["reason"], n, step["why"])
+    return "%s [run %s]" % (base, run_id) if run_id else base
 
 
-def step_argv(play, n, step):
-    """The same argv for planning and running; vpsexec wants --reason in both."""
-    head = ([step["hosts"], "push", step["push"], "--sha256", step["sha256"]]
-            if "push" in step else [step["hosts"], step["cmd"]])
-    return head + step["flags"] + ["--reason", step_reason(play, n, step)]
+def step_argv(play, n, step, run_id=None):
+    """The same argv for planning and running; vpsexec wants --reason in both.
+
+    An action step hands the door `--action NAME --with JSON`: vpsrun never
+    builds the body itself (docs/ACTIONS.md), only the typed literals the
+    policy's play step already carries."""
+    if "push" in step:
+        head = [step["hosts"], "push", step["push"], "--sha256", step["sha256"]]
+    elif "action" in step:
+        head = [step["hosts"], "--action", step["action"], "--with",
+                json.dumps(step["with"], sort_keys=True, separators=(",", ":"))]
+    else:
+        head = [step["hosts"], step["cmd"]]
+    return head + step["flags"] + ["--reason", step_reason(play, n, step, run_id)]
 
 
-def plan_all(play, run, reads=()):
+def plan_all(play, run, reads=(), run_id=None):
     """Plan every step through the real door. Returns [(plan_text, digest)].
     A read step is NOT sent to the door here (it would run now)."""
     plans = []
@@ -245,9 +438,9 @@ def plan_all(play, run, reads=()):
             plans.append(("READ — runs here, after approval, as a plain read (no "
                           "--run, no approval, no contract):\n  vpsexec %s"
                           % " ".join(shlex.quote(a) for a in step_argv(play, n, s)[:-2]),
-                          read_tag(play, n, s)))
+                          read_tag(play, n, s, run_id)))
             continue
-        rc, out = run(step_argv(play, n, s))
+        rc, out = run(step_argv(play, n, s, run_id))
         found = DIGEST_RE.findall(out)
         if rc != 0 or len(set(found)) != 1:
             raise Refused("step %d did not produce a plan (rc=%s):\n%s" % (n, rc, out))
@@ -258,10 +451,15 @@ def plan_all(play, run, reads=()):
 def phrase(play, digests=()):
     """Step count, break-glass count, and 6 hex of the plans shown: typing it
     approves THESE plans, not any play of the same length."""
-    bg = sum(1 for s in play["steps"] if "--break-glass" in s["flags"])
+    return run_phrase("PLAY", play["steps"], digests)
+
+
+def run_phrase(prefix, steps, digests=()):
+    """`<prefix>:<steps>[:BREAK-GLASS:<n>][:<tag>]` over the steps that will run."""
+    bg = sum(1 for s in steps if "--break-glass" in s["flags"])
     tag = hashlib.sha256("".join(digests).encode()).hexdigest()[:6] if digests else ""
-    return "PLAY:%d%s%s" % (len(play["steps"]), ":BREAK-GLASS:%d" % bg if bg else "",
-                            ":" + tag if tag else "")
+    return "%s:%d%s%s" % (prefix, len(steps), ":BREAK-GLASS:%d" % bg if bg else "",
+                          ":" + tag if tag else "")
 
 
 def run_prechecks(play, check):
@@ -280,6 +478,63 @@ def run_prechecks(play, check):
                           "it reports, then re-run the play." % (name, ", ".join(hosts)))
 
 
+def door_grants(text):
+    """{session_id: {kind, until, code, left}} from the door's plan for one
+    step: the grants it found VALID for that exact plan. Only the block under
+    the door's own header is read."""
+    lines = text.splitlines()
+    heads = [i for i, l in enumerate(lines) if l.startswith(GRANTS_HEAD)]
+    found = {}
+    if not heads:
+        return found
+    for line in lines[heads[0] + 1:]:
+        m = GRANT_LINE_RE.match(line)
+        if not m:
+            break
+        found[m.group(1)] = {"session_id": m.group(1), "kind": m.group(2),
+                             "until": m.group(3), "code": m.group(4),
+                             "left": None if m.group(5) is None else int(m.group(5)),
+                             "release": m.group(6)}
+    return found
+
+
+def _short_id(sid):
+    return sid[:11] if sid[2:3] == "_" else sid[:8]
+
+
+def auto_pick(play, plans, bg, grant_dir=None, release=None):
+    """ONE grant for the whole play: valid for every break-glass step's exact
+    plan (as the door judged each), with enough uses left for all of them.
+    Narrower kind first, then soonest-expiring, then lowest id. A grant minted
+    --for-release is picked only by that release (M6): a play or another
+    release never spends its uses. Returns (absolute path, info), or None when
+    nothing covers every step."""
+    per_step = [door_grants(plans[n - 1][0]) for n in bg]
+    common = set(per_step[0]).intersection(*per_step[1:])
+    ok = []
+    for sid in common:
+        info = dict(per_step[0][sid])
+        if info.get("release") != release and info.get("release") is not None:
+            continue
+        if info["kind"] == "reusable":
+            left = min(ps[sid]["left"] if ps[sid]["left"] is not None else -1
+                       for ps in per_step)
+            if left < len(bg):
+                continue
+            info["left"] = left
+        ok.append(info)
+    if not ok:
+        return None
+    ok.sort(key=lambda i: (KIND_ORDER.index(i["kind"]), i["until"], i["session_id"]))
+    chosen = ok[0]
+    chosen["ties"] = [i["session_id"] for i in ok[1:]
+                      if (i["kind"], i["until"]) == (chosen["kind"], chosen["until"])]
+    if grant_dir is None:
+        from vpscfg import vpsexecgrant
+        grant_dir = vpsexecgrant.GRANT_DIR
+    return str(Path(grant_dir) / ("%s.json" % chosen["session_id"])), chosen
+
+
 def contract_coverage(play, plans, contract, load_grant=None):
     """Break-glass step numbers, after refusing anything a contract would not
     cover. Runs before the play is approved, so a play never fails halfway on
@@ -290,9 +545,9 @@ def contract_coverage(play, plans, contract, load_grant=None):
     if contract is None:
         raise Refused(
             "step(s) %s are break-glass, and --approve alone no longer approves "
-            "break-glass. Mint a grant for that runbook (vpsexec grant new "
-            "<runbook> --ttl <ttl> --run), then re-run: vpsrun %s "
-            "--approval-contract=FILE. Nothing was run."
+            "break-glass, and no valid grant in ~/.vpscfg/grants covers all of "
+            "them. Mint one (vpsexec grant new <runbook> --ttl <ttl> --run, or "
+            "--kind reusable), then re-run: vpsrun %s. Nothing was run."
             % (", ".join(map(str, bg)), play["path"]))
     if load_grant is None:
         from vpscfg import gates, vpsexecgrant
@@ -303,6 +558,22 @@ def contract_coverage(play, plans, contract, load_grant=None):
             except gates.Refused as r:
                 raise Refused(str(r))
     grant = load_grant(contract)
+    if grant.get("kind") == "reusable":
+        # No step list to compare: the door judged each plan against the
+        # policy as loaded now and listed the grants that cover it.
+        sid = grant["session_id"]
+        listed = [door_grants(plans[n - 1][0]).get(sid) for n in bg]
+        uncovered = [n for n, info in zip(bg, listed) if info is None]
+        if uncovered:
+            raise Refused("reusable grant %s does not cover break-glass step(s) %s "
+                          "(the door did not list it as valid for those plans). "
+                          "Nothing was run." % (contract, ", ".join(map(str, uncovered))))
+        left = min(info["left"] if info["left"] is not None else -1 for info in listed)
+        if left < len(bg):
+            raise Refused("reusable grant %s has %d use(s) left; this play needs %d "
+                          "(one per break-glass step). Nothing was run."
+                          % (contract, max(left, 0), len(bg)))
+        return bg
     covered = set((st["cmd"], st["where"]) for st in grant["steps"])
     uncovered = []
     for n in bg:
@@ -322,64 +593,1201 @@ def contract_coverage(play, plans, contract, load_grant=None):
     return bg
 
 
-def run_play(play, run, prompt, stream, check=None, contract=None, load_grant=None):
-    if not (hasattr(stream, "isatty") and stream.isatty()):
-        raise Refused("vpsrun needs a real terminal. It is how a HUMAN approves a "
-                      "play; open a terminal (not `!`) and run it there.")
-    if play.get("precheck"):
-        run_prechecks(play, check or _vpscfg_run)
-    reads = read_steps(play)
-    plans = plan_all(play, run, reads)
-    bg_steps = contract_coverage(play, plans, contract, load_grant)
-    for n, (s, (text, digest)) in enumerate(zip(play["steps"], plans), 1):
+# ---------------------------------------------------------------------------
+# runs: one run id per play or release, journaled per step (stream `vpsrun`)
+# ---------------------------------------------------------------------------
+
+def new_run_id():
+    return "r_" + secrets.token_hex(8)
+
+
+def _rjournal(entry):
+    """Journal-or-refuse: a step whose start cannot be recorded does not run,
+    because resume could not tell later whether it had."""
+    from vpscfg import journal
+    journal.append(RUN_STREAM, entry)
+
+
+def _run_records(run_id=None):
+    from vpscfg import vpsexeclog
+    try:
+        recs = vpsexeclog.read(RUN_STREAM)
+    except Exception as e:
+        raise Refused("journal stream %s unreadable (%s) — refusing to guess what "
+                      "already ran" % (RUN_STREAM, e))
+    if any(r.get("event") == "_unparseable" for r in recs):
+        raise Refused("journal stream %s has unparseable lines — resume cannot trust "
+                      "it; run `vpscfg journal verify`" % RUN_STREAM)
+    return [r for r in recs if run_id is None or r.get("run_id") == run_id]
+
+
+def find_resumable(kind, name):
+    """The latest run of this play or release, which must not have completed."""
+    starts = [r for r in _run_records() if r.get("event") == "run_started"
+              and r.get("kind") == kind and r.get("name") == name]
+    if not starts:
+        raise Refused("no earlier run of %s %s to resume — run it without --resume"
+                      % (kind, name))
+    run_id = str(starts[-1].get("run_id"))
+    if not RUN_ID_RE.match(run_id):
+        raise Refused("the latest run of %s %s has a malformed run id %r" % (kind, name, run_id))
+    if any(r.get("event") == "run_complete" for r in _run_records(run_id)):
+        raise Refused("the latest run (%s) of %s %s completed — nothing to resume. "
+                      "Run it again without --resume for a new run." % (run_id, kind, name))
+    return run_id
+
+
+def _key(play):
+    return os.path.realpath(play["path"])
+
+
+def _play_name(play):
+    return Path(play["path"]).stem
+
+
+def prepare(plays, run, run_id, check=None, prechecks=True):
+    """Plan every step of every play through the door (reads are not planned).
+    One unit per step, in run order."""
+    units = []
+    for play in plays:
+        if prechecks and play.get("precheck"):
+            run_prechecks(play, check or _vpscfg_run)
+        reads = read_steps(play)
+        plans = plan_all(play, run, reads, run_id)
+        for n, (text, digest) in enumerate(plans, 1):
+            units.append({"play": play, "n": n, "step": play["steps"][n - 1],
+                          "text": text, "digest": digest, "read": n in reads,
+                          "done": None, "reports": {}})
+    return units
+
+
+def _door_outcome(u, run_id, started):
+    """A step whose start is journaled but whose end is not (vpsrun was killed,
+    the terminal closed). The door's own journal settles it: no attempt with
+    this run's reason and plan-hash since the start => it never reached the
+    door; an attempt and its mutation_complete => that outcome; an attempt and
+    nothing after it => `unknown`, which _check_uncertain settles only through
+    `vpsexec reconcile`.
+
+    The door's journal is searched by the plan-hash THIS start recorded (and
+    the run-scoped reason), never by the step's new plan: a step that reached
+    the door and now plans differently refuses ("changed after it reached the
+    door") instead of being settled, or re-run, under another plan."""
+    from vpscfg import vpsexeclog
+    recs = vpsexeclog.read()
+    reason = step_reason(u["play"], u["n"], u["step"], run_id)
+    digest = started.get("digest")
+    idx = _attempts(recs, digest, reason)
+    started_age = vpsexeclog.age_seconds(started)
+    if not idx or started_age is None:
+        return None
+    attempt = recs[idx[-1]]
+    attempt_age = vpsexeclog.age_seconds(attempt)
+    if attempt_age is None or attempt_age > started_age + 1:
+        return None  # only an older attempt: this start never reached the door
+    _refuse_if_changed(u, run_id, digest)
+    j = _complete_after(recs, idx[-1])
+    if j is None:
+        return {"status": "unknown", "digest": digest, "reports": {}}
+    done = recs[j]
+    ok = not done.get("failed") and not done.get("not_run")
+    return {"status": "ok" if ok else "failed", "digest": digest, "reports": {}}
+
+
+def _attempts(recs, digest, reason):
+    return [i for i, r in enumerate(recs) if r.get("event") == "mutation_attempt"
+            and r.get("plan_hash") == digest and r.get("reason") == reason]
+
+
+def _complete_after(recs, i):
+    """Index of the attempt's own mutation_complete, or None."""
+    a = recs[i]
+    for j in range(i + 1, len(recs)):
+        r = recs[j]
+        if (r.get("event") == "mutation_complete" and r.get("command") == a.get("command")
+                and r.get("hosts") == a.get("hosts")):
+            return j
+    return None
+
+
+def _refuse_if_changed(u, run_id, digest):
+    if digest != u["digest"]:
+        raise Refused(
+            "%s step %d changed after it reached the door in run %s: it ran (or may "
+            "have run) as plan %s and now plans as %s. Resume will not settle or re-run "
+            "it under a different plan. Check what it did (vpsexec last), restore the "
+            "play or the state it planned against, or start a fresh run without "
+            "--resume." % (_play_name(u["play"]), u["n"], run_id, str(digest)[:12],
+                           u["digest"][:12]))
+
+
+def _uncertain_ops(u, run_id, recs, digest):
+    """What the door left UNCERTAIN for this step in this run, as a list of
+    {host, op, attempt}: a detached step that lost contact (a `step` record
+    with `uncertain`), a host whose lock it retained (`lock_retained` on
+    mutation_complete), or — when an attempt has NO mutation_complete at all
+    (Ctrl-C, a dropped terminal) — every host of that attempt, with the
+    operation id its `step` records carry, if any. Searched by `digest`, the
+    plan-hash the run recorded, and the run-scoped reason. Every attempt of
+    the step in this run counts, not only the last one."""
+    reason = step_reason(u["play"], u["n"], u["step"], run_id)
+    found = []
+    for i in _attempts(recs, digest, reason):
+        hosts = recs[i].get("hosts") or []
+        j = _complete_after(recs, i)
+        window = recs[i + 1:j if j is not None else len(recs)]
+        steps = [r for r in window if r.get("event") == "step" and r.get("host") in hosts]
+        if j is None:
+            for h in hosts:
+                mine = [r for r in steps if r.get("host") == h]
+                ops = [r.get("operation_id") for r in mine if r.get("operation_id")]
+                e = {"host": h, "op": ops[-1] if ops else None, "attempt": i}
+                # A host the door FINISHED before it died is settled by the
+                # door's own `host_done` record — written only after every
+                # step, the verify and the lock release (its lock is free, so
+                # a reconcile could only say so). A per-step record proves
+                # nothing: the door may have died between container steps or
+                # during the verify, with the lock still held.
+                # Only THIS attempt's host_done: it carries the attempt's
+                # run-scoped reason and plan-hash, and it is searched only up
+                # to the next mutation_attempt that reaches this host (a later
+                # operation's host_done never counts).
+                stop = next((k for k, r in enumerate(window)
+                             if r.get("event") == "mutation_attempt"
+                             and h in (r.get("hosts") or [])), len(window))
+                done = [r for r in window[:stop] if r.get("event") == "host_done"
+                        and r.get("host") == h and r.get("reason") == reason
+                        and r.get("plan_hash") == digest
+                        and (not e["op"] or r.get("operation_id") == e["op"])]
+                if done:
+                    d = done[-1]
+                    e["op"] = e["op"] or d.get("operation_id")
+                    e["settled"] = {"event": "finished", "host": h, "verdict": "COMPLETED",
+                                    "rc": d.get("rc"), "verify_rc": d.get("verify_rc"),
+                                    "already_done": bool(d.get("already_done"))}
+                found.append(e)
+            continue
+        for r in steps:
+            if r.get("uncertain"):
+                found.append({"host": r["host"], "op": r.get("operation_id"), "attempt": i})
+        for h, op in sorted((recs[j].get("lock_retained") or {}).items()):
+            found.append({"host": h, "op": op, "attempt": i})
+    out = []
+    for e in found:
+        if all((e["host"], e["op"]) != (o["host"], o["op"]) for o in out):
+            out.append(e)
+    return out, reason
+
+
+def _settlement(e, recs, reason):
+    """The `vpsexec reconcile` record that settles one uncertain entry: a
+    `reconciled` record after the attempt for that host whose operation id is
+    the entry's, or — when no op id was journaled — whose lock owner carries
+    this run's step reason; or a `reconcile_free` record (the lock was already
+    free when a human looked). For a KNOWN op, a free lock with no host_done
+    means the door released it and died before journaling the outcome: it is
+    settled as RELEASED, OUTCOME UNKNOWN, which never counts as completed (the
+    step runs again; never SKIP-DONE). None if open."""
+    for r in recs[e["attempt"] + 1:]:
+        if r.get("host") != e["host"]:
+            continue
+        if r.get("event") == "reconciled" and (
+                (e["op"] and r.get("operation_id") == e["op"])
+                or (not e["op"] and (r.get("owner") or {}).get("reason") == reason)):
+            return r
+        if r.get("event") == "reconcile_free":
+            if not e["op"]:
+                return r
+            # A known op whose lock is free with no host_done: the door
+            # released it and died before journaling the outcome (or that
+            # write failed). Released by the door, outcome UNKNOWN: it runs
+            # again (never SKIP-DONE).
+            return dict(r, verdict="RELEASED, OUTCOME UNKNOWN")
+    return None
+
+
+def _completed_ok(s):
+    return (s.get("event") in ("reconciled", "finished") and s.get("verdict") == "COMPLETED"
+            and s.get("rc") == 0 and s.get("verify_rc") in (None, 0))
+
+
+def _host_outcomes(entries, recs):
+    """(done, not_done): the step's hosts split by whether the step provably
+    completed there — reconciled or finished COMPLETED rc=0 with its verify
+    passing (or none), or a host the door itself reported successful."""
+    done, not_done = [], []
+
+    def add(lst, h):
+        if h not in done and h not in not_done:
+            lst.append(h)
+    for e in entries:
+        add(done if _completed_ok(e["settled"]) else not_done, e["host"])
+    for i in set(e["attempt"] for e in entries):
+        j = _complete_after(recs, i)
+        if j is None:
+            continue  # every host of an attempt with no outcome is an entry
+        failed = set(recs[j].get("failed") or []) | set(recs[j].get("not_run") or [])
+        for h in recs[i].get("hosts") or []:
+            add(not_done if h in failed else done, h)
+    return done, not_done
+
+
+def _check_uncertain(u, run_id, digest, ask=None):
+    """A failed or unknown step whose outcome the door could not establish is
+    neither done nor safely failed. Resume refuses it until `vpsexec reconcile
+    <host>` has journaled each host; the refusal names the command.
+
+    A `reconciled` record outranks the door's host_done; a known op whose lock
+    a reconcile found free with no host_done is RELEASED, OUTCOME UNKNOWN
+    (not completed). Settled: when the step provably completed on EVERY host (reconciled
+    COMPLETED rc=0, or finished by the door — its host_done record, written
+    only after the verify and the lock release — with rc=0; verify passed or
+    none), it is NOT re-run by default: the human types SKIP-DONE:<play>:<n>
+    (journaled done, settled_from=reconcile|door) or RERUN:<play>:<n>; anything
+    else refuses. The prompt says, per host, which evidence it rests on. When it
+    completed on SOME hosts only, resume cannot re-run it on the others alone:
+    it asks for an explicit RERUN:<play>:<n> (the step runs again on ALL its
+    hosts, the completed ones named), anything else refuses. When it completed
+    nowhere it runs again through the door, never counted as done.
+    Returns True when the step is now settled done."""
+    from vpscfg import vpsexeclog
+    recs = vpsexeclog.read()
+    entries, reason = _uncertain_ops(u, run_id, recs, digest)
+    if not entries:
+        return False
+    _refuse_if_changed(u, run_id, digest)
+    for e in entries:
+        # A reconcile that inspected the host outranks the door's host_done.
+        rec = _settlement(e, recs, reason)
+        if e.get("settled") is None or (rec and rec.get("event") == "reconciled"):
+            e["settled"] = rec if rec is not None else e.get("settled")
+    open_hosts = []
+    for e in entries:
+        if e["settled"] is None and e["host"] not in open_hosts:
+            open_hosts.append(e["host"])
+    if open_hosts:
+        raise Refused(
+            "%s step %d's outcome is UNCERTAIN in run %s (it reached the door, and the "
+            "door lost contact or its outcome was never recorded; a lock may be "
+            "retained on %s). Resume refuses to guess: it neither skips it nor runs it "
+            "blind. Next, a human runs, in a terminal:\n%s\nthen resume again."
+            % (_play_name(u["play"]), u["n"], run_id, ", ".join(open_hosts),
+               "\n".join("  vpsexec reconcile %s" % h for h in open_hosts)))
+    for e in entries:
+        s = e["settled"]
+        print("  %s step %d: uncertain on %s, %s (verdict %s%s)"
+              % (_play_name(u["play"]), u["n"], e["host"],
+                 "finished before the door died" if s.get("event") == "finished"
+                 else "reconciled",
+                 s.get("verdict") or "lock free",
+                 "" if s.get("rc") is None else " rc=%s" % s.get("rc")))
+    name = _play_name(u["play"])
+    skip, rerun = "SKIP-DONE:%s:%d" % (name, u["n"]), "RERUN:%s:%d" % (name, u["n"])
+    done, not_done = _host_outcomes(entries, recs)
+    if not done:
+        print("    — it runs again through the door, not counted as done.")
+        return False
+    # A typed action's idempotent check settles this on its own (S7: the check
+    # never released the lock — the door had already finished and released it
+    # before it died). The check already proved every host done; there is
+    # nothing for a human to decide, so no SKIP-DONE/RERUN phrase is asked.
+    if not not_done and all(e["settled"].get("event") == "finished"
+                            and e["settled"].get("already_done") for e in entries):
+        print("    [done] %s — settled by the action's own check, no phrase needed"
+              % ", ".join(done))
+        _rjournal({"event": "step_done", "run_id": run_id, "play": _key(u["play"]),
+                   "step": u["n"], "digest": u["digest"], "status": "ok", "rc": 0,
+                   "settled_from": "check", "operations": [e["op"] for e in entries],
+                   "reports": {}})
+        return True
+    caution = _rerun_caution(u["step"])
+    if caution:
+        print("    CAUTION: %s" % caution)
+    if not_done:
+        if ask is None:
+            raise Refused("%s step %d completed on %s but not on %s; resuming needs a "
+                          "human at a terminal to type %s" % (name, u["n"], ", ".join(done),
+                                                              ", ".join(not_done), rerun))
+        answer = ask("%s step %d COMPLETED on %s but not on %s. Resume cannot run it on "
+                     "some of its hosts only. Type %s to run it again on ALL its hosts "
+                     "(including %s), anything else aborts: "
+                     % (name, u["n"], ", ".join(done), ", ".join(not_done), rerun,
+                        ", ".join(done))).strip()
+        if answer != rerun:
+            raise Refused("%s was not typed — nothing ran. To finish only %s, run that "
+                          "step by hand through vpsexec, then start a fresh run."
+                          % (rerun, ", ".join(not_done)))
+        print("    — it runs again through the door on all its hosts, not counted as done.")
+        return False
+    # Say where each host's COMPLETED comes from: only a host a `vpsexec
+    # reconcile` actually inspected is "reconciled"; one the door itself
+    # finished (host_done) is "finished by the door".
+    sources = sorted(set("reconcile" if e["settled"].get("event") == "reconciled"
+                         else "door" for e in entries))
+    evidence = "; ".join(
+        "%s: %s" % (e["host"], "reconciled COMPLETED rc=0"
+                    if e["settled"].get("event") == "reconciled"
+                    else "finished by the door (host_done rc=0)") for e in entries)
+    if ask is None:
+        raise Refused("%s step %d COMPLETED rc=0 on every host (%s); resuming needs a "
+                      "human at a terminal to type %s or %s"
+                      % (name, u["n"], evidence, skip, rerun))
+    answer = ask("%s step %d COMPLETED rc=0 on every host (%s). Type %s to count it done, "
+                 "or %s to run it again; anything else aborts: "
+                 % (name, u["n"], evidence, skip, rerun)).strip()
+    if answer == rerun:
+        print("    — it runs again through the door, not counted as done.")
+        return False
+    if answer != skip:
+        raise Refused("neither %s nor %s was typed — nothing ran" % (skip, rerun))
+    _rjournal({"event": "step_done", "run_id": run_id, "play": _key(u["play"]),
+               "step": u["n"], "digest": u["digest"], "status": "ok", "rc": 0,
+               "settled_from": "+".join(sources),
+               "operations": [e["op"] for e in entries], "reports": {}})
+    return True
+
+
+def _rerun_caution(step):
+    """What a RERUN repeats that a human should know before typing it (L4):
+    `migrate` is not idempotent, and its `sql_dir` runner applies EVERY .sql
+    file again, including the ones that already succeeded (it keeps no
+    record of applied files; the other runners' own tools usually do)."""
+    if step.get("action", "").split("@", 1)[0] != "migrate":
+        return None
+    if (step.get("with") or {}).get("runner") == "sql_dir":
+        return ("RERUN of migrate (runner sql_dir) applies every .sql file in its workdir "
+                "AGAIN, including the ones that already succeeded — only type RERUN if "
+                "each file is safe to apply twice; otherwise SKIP-DONE and finish by hand")
+    return ("RERUN of migrate runs the project's migration tool again; it is safe only "
+            "if that tool skips migrations it already applied")
+
+
+def resume_plan(units, run_id, ask=None):
+    """Mark each unit done from THIS run's journal. Only an `ok` or `skipped`
+    record with the same plan-hash at the same position skips a step; a
+    position that succeeded under a different plan refuses the resume.
+    `ask(msg) -> str` is the TTY prompt used to settle a reconciled step."""
+    last = {}
+    for r in _run_records(run_id):
+        if r.get("event") in ("step_started", "step_done"):
+            last[(r.get("play"), r.get("step"))] = r
+    for u in units:
+        rec = last.get((_key(u["play"]), u["n"]))
+        if rec is None:
+            continue
+        if rec.get("event") == "step_started":
+            if u["read"]:
+                continue  # a read is safe to repeat
+            rec = _door_outcome(u, run_id, rec)
+            if rec is None:
+                continue
+            if rec["status"] != "unknown":
+                _rjournal({"event": "step_done", "run_id": run_id,
+                           "play": _key(u["play"]), "step": u["n"],
+                           "digest": rec["digest"], "status": rec["status"],
+                           "rc": 0 if rec["status"] == "ok" else 1,
+                           "settled_from": "vpsexec journal", "reports": {}})
+        if rec.get("status") not in ("ok", "skipped"):
+            if not u["read"] and _check_uncertain(u, run_id, rec.get("digest"), ask):
+                u["done"], u["reports"] = "ok", {}
+            continue
+        if rec.get("digest") != u["digest"]:
+            raise Refused(
+                "%s step %d already %s in run %s with plan %s, but now plans as %s. "
+                "The step changed under the run; resume will neither re-run a done "
+                "step nor skip a changed one. Restore the play, or start a fresh run "
+                "without --resume." % (_play_name(u["play"]), u["n"], rec["status"],
+                                       run_id, str(rec.get("digest"))[:12], u["digest"][:12]))
+        u["done"] = rec["status"]
+        u["reports"] = dict(rec.get("reports") or {})
+    return units
+
+
+def _guard_only(rc, out):
+    """The door refused, and the identical-plan guard is its only refusal."""
+    return rc != 0 and GUARD_TEXT in out and out.count("REFUSED:") == 1
+
+
+def own_repeat_wait(u, run_id, window=None):
+    """(seconds to wait, None) when every attempt of this plan inside the
+    door's window is THIS run's attempt at THIS step and this run's journal
+    shows that step failed; otherwise (None, why). The door decides again
+    after the wait; nothing here lifts its guard."""
+    from vpscfg import vpsexec, vpsexeclog
+    window = window or vpsexec.REPEAT_WINDOW_SECONDS
+    reason = step_reason(u["play"], u["n"], u["step"], run_id)
+    attempts = vpsexeclog.query(vpsexeclog.read(), plan_hash=u["digest"],
+                                event="mutation_attempt", since_seconds=window + 5)
+    if not attempts:
+        return None, "the door's journal shows no attempt of this plan in its window"
+    others = [a for a in attempts if a.get("reason") != reason]
+    if others:
+        return None, ("another run's identical plan ran inside the window (reason %r)"
+                      % others[-1].get("reason"))
+    dones = [r for r in _run_records(run_id) if r.get("event") == "step_done"
+             and r.get("play") == _key(u["play"]) and r.get("step") == u["n"]]
+    if not dones or dones[-1].get("status") != "failed" or dones[-1].get("digest") != u["digest"]:
+        return None, "this run's journal does not show this step failing"
+    age = vpsexeclog.age_seconds(attempts[-1])
+    if age is None:
+        return None, "the earlier attempt's timestamp is unreadable"
+    return max(1, int(window - age) + 2), None
+
+
+def _window():
+    from vpscfg import vpsexec
+    return vpsexec.REPEAT_WINDOW_SECONDS
+
+
+def countdown(seconds, sleep):
+    for left in range(seconds, 0, -1):
+        sys.stdout.write("\r  repeat guard: retrying in %4ds  (Ctrl-C stops; --resume "
+                         "continues later) " % left)
+        sys.stdout.flush()
+        sleep(1)
+    print("\r  repeat guard: window passed — asking the door again.%s" % (" " * 30))
+
+
+def _run_unit(u, run, run_id, contract, sleep):
+    """(problem, rc, output) for one step. Reads go as plain reads."""
+    argv = step_argv(u["play"], u["n"], u["step"], run_id)
+    if u["read"]:
+        # A plain read: the same argv a human would type, with no --run,
+        # --approve or contract. Without --run the door executes nothing
+        # that is not a read, so a step it judges otherwise ran nothing.
+        rc, out = run(argv)
+        print(printable(out.rstrip()))
+        tier = TIER_RE.search(out)
+        if rc == 0 and (tier is None or tier.group(1) != "read"):
+            return "not-read", rc, out
+        return None, rc, out
+    extra = ["--approval-contract=" + contract] if u.get("bg") else []
+    full = argv + ["--run", "--approve=" + u["digest"]] + extra
+    rc, out = run(full)
+    print(printable(out.rstrip()))
+    if _guard_only(rc, out):
+        wait, why = own_repeat_wait(u, run_id)
+        if wait is None:
+            print("  repeat guard: NOT retrying — %s." % why)
+            print("  To continue: wait until %s (the door's %ds window), then "
+                  "resume this run with --resume."
+                  % (time.strftime("%H:%M", time.localtime(time.time() + _window() + 60)),
+                     _window()))
+        else:
+            print("  repeat guard: the earlier identical attempt was this run's own "
+                  "failed step; waiting out the door's window, then asking again.")
+            countdown(wait, sleep)
+            rc, out = run(full)
+            print(printable(out.rstrip()))
+    return None, rc, out
+
+
+def _when_verdict(u, units):
+    """True/False for a conditional step, or None when it cannot be known."""
+    cond = u["step"]["when"]
+    dep = [x for x in units if x["play"] is u["play"] and x["n"] == cond["step"]][0]
+    if dep["done"] == "skipped":
+        return False  # it did not run, so it reported nothing
+    return dep["reports"].get(str(u["n"]))
+
+
+def _reports(u, out):
+    """For every later step conditioned on this one: did its regex match?"""
+    if not u["step"].get("id"):
+        return {}
+    remote = remote_output(out)
+    return dict((str(k), bool(re.search(s["when"]["regex"], remote)))
+                for k, s in enumerate(u["play"]["steps"], 1)
+                if s.get("when") and s["when"]["step"] == u["n"])
+
+
+def _notify(ctx, event, **fields):
+    send = ctx.get("notify")
+    if send is None:
+        from vpscfg import notify
+        send = notify.send
+    send(event, dict(fields, kind=ctx["kind"], name=ctx["name"], run_id=ctx["run_id"]))
+
+
+def _where(ctx, u):
+    if ctx["kind"] == "release":
+        return "play %s step %d" % (_play_name(u["play"]), u["n"])
+    return "step %d" % u["n"]
+
+
+def _halt(ctx, u, rc, later, why=None, out=""):
+    noun = ctx["kind"].upper()
+    if why:
+        print("\n%s HALTED at %s: %s %d later step(s) NOT run."
+              % (noun, _where(ctx, u), why, later))
+    else:
+        print("\n%s HALTED at %s (rc=%s). %d later step(s) NOT run."
+              % (noun, _where(ctx, u), rc, later))
+    print("The agent can read what happened with: vpsexec last -n %d" % ctx["ran"])
+    locked = []
+    for host in RECONCILE_RE.findall(out or ""):
+        if host not in locked:
+            locked.append(host)
+    for host in locked:
+        print("A host lock is held on %s. Next, a human runs, in a terminal:\n"
+              "  vpsexec reconcile %s" % (host, host))
+    print("Resume this run (%s) after fixing the cause:\n  %s" % (ctx["run_id"], ctx["resume"]))
+    offers = ctx.get("on_fail") or []
+    if offers:
+        print("Rollback — offered, NOT run (a human decides):")
+        for o in offers:
+            print("  %s" % o["command"])
+    _rjournal({"event": "run_halted", "run_id": ctx["run_id"], "kind": ctx["kind"],
+               "name": ctx["name"], "play": _key(u["play"]), "step": u["n"], "rc": rc})
+    _notify(ctx, "halt", at=_where(ctx, u), rc=rc, resume=ctx["resume"],
+            rollback=[o["command"] for o in offers])
+    return rc
+
+
+def _stop_at_boundary(ctx, pk, play, rc, why, extra=None):
+    _rjournal(dict({"event": "run_halted", "run_id": ctx["run_id"], "kind": ctx["kind"],
+                    "name": ctx["name"], "play": pk, "step": 0, "rc": rc}, **(extra or {})))
+    print("%s %s before play %s — nothing of it ran. Continue with:\n  %s"
+          % (ctx["kind"].upper(), why, _play_name(play), ctx["resume"]))
+    _notify(ctx, "halt", at="before play %s" % _play_name(play), rc=rc,
+            resume=ctx["resume"], rollback=[])
+    return rc
+
+
+def _replan_play(units, pk, play, ctx):
+    """At a play boundary (and after its hold): plan the play again, because
+    the plays before it changed live state since the release phrase. If any
+    step now plans differently, show the new plans and ask a phrase bound to
+    the NEW plan-hashes (M7); anything else stops here. Returns rc or None."""
+    mine = [u for u in units if _key(u["play"]) == pk and not u["done"]]
+    if not mine:
+        return None
+    fresh = dict((f["n"], f) for f in ctx["replan"](play))
+    changed = [u for u in mine if not u["read"] and fresh[u["n"]]["digest"] != u["digest"]]
+    if not changed:
+        return None
+    for u in changed:
+        f = fresh[u["n"]]
+        if bool(BREAK_GLASS_RE.search(f["text"])) != bool(BREAK_GLASS_RE.search(u["text"])):
+            return _stop_at_boundary(ctx, pk, play, 2, "STOPPED (step %d changed break-glass "
+                                     "status on re-plan; its grant was chosen for the old "
+                                     "plan)" % u["n"])
+    print("")
+    print("RE-PLANNED play %s — %d step(s) now plan differently than when the release "
+          "was approved (an earlier play changed the hosts):" % (_play_name(play),
+                                                                  len(changed)))
+    for u in changed:
         print("=" * 72)
-        print("STEP %d of %d — %s" % (n, len(plans), s["why"]))
-        print(printable(text.rstrip()))
+        print("STEP %d — %s   (was plan %s, now %s)" % (u["n"], u["step"]["why"],
+                                                       u["digest"][:12],
+                                                       fresh[u["n"]]["digest"][:12]))
+        print(printable(fresh[u["n"]]["text"].rstrip()))
     print("=" * 72)
-    print("play   : %s  (sha256 %s)" % (play["path"], play["sha256"][:16]))
-    print("reason : %s" % play["reason"])
+    want = run_phrase("REPLAN:%s" % _play_name(play), [u["step"] for u in changed],
+                      [fresh[u["n"]]["digest"] for u in changed])
+    from vpscfg import vpsexecgrant
+    vpsexecgrant.flush_input(ctx["stream"])
+    if ctx["prompt"]("Type %s to run the new plans, anything else stops here: "
+                     % want).strip() != want:
+        return _stop_at_boundary(ctx, pk, play, 3, "STOPPED (new plans not approved)",
+                                 {"replan": True})
+    for u in changed:
+        u["digest"], u["text"] = fresh[u["n"]]["digest"], fresh[u["n"]]["text"]
+    _rjournal({"event": "play_replanned", "run_id": ctx["run_id"], "play": pk,
+               "steps": [{"step": u["n"], "digest": u["digest"]} for u in changed]})
+    return None
+
+
+def execute_units(units, run, ctx):
+    """Run every unit not already done, in order; halt on the first failure.
+    With ctx["replan"] (a release), each play after the first one that runs is
+    planned again at its boundary (after its hold) and changed plans are
+    approved again before any of its steps run."""
+    run_id, holds = ctx["run_id"], ctx.get("holds") or {}
+    sleep = ctx.get("sleep") or time.sleep
+    passed_hold, replanned = set(), set()
+    total = len(units)
+    ctx["ran"] = 0
+    for i, u in enumerate(units):
+        play, n, s = u["play"], u["n"], u["step"]
+        pk = _key(play)
+        hold = holds.get(pk)
+        if hold and pk not in passed_hold and not any(
+                x["done"] for x in units if _key(x["play"]) == pk):
+            passed_hold.add(pk)
+            want = "GO:%s" % _play_name(play)
+            print("")
+            print("HOLD before play %s — %s" % (_play_name(play), hold))
+            from vpscfg import vpsexecgrant
+            vpsexecgrant.flush_input(ctx["stream"])
+            if ctx["prompt"]("Type %s to continue, anything else stops here: " % want
+                             ).strip() != want:
+                _rjournal({"event": "run_halted", "run_id": run_id, "kind": ctx["kind"],
+                           "name": ctx["name"], "play": pk, "step": 0, "rc": 3,
+                           "hold": True})
+                print("%s HELD before play %s — nothing of it ran. Continue with:\n  %s"
+                      % (ctx["kind"].upper(), _play_name(play), ctx["resume"]))
+                return 3
+        if ctx.get("replan") and pk not in replanned and ctx["ran"]:
+            replanned.add(pk)
+            stopped = _replan_play(units, pk, play, ctx)
+            if stopped is not None:
+                return stopped
+        replanned.add(pk)
+        print("")
+        if ctx["kind"] == "release":
+            print(">>> PLAY %s STEP %d of %d — %s"
+                  % (_play_name(play), n, len(play["steps"]), s["why"]))
+        else:
+            print(">>> STEP %d of %d — %s" % (n, total, s["why"]))
+        if u["done"]:
+            print("    already %s in run %s — not run again"
+                  % ("done" if u["done"] == "ok" else "skipped by its condition", run_id))
+            continue
+        later = sum(1 for x in units[i + 1:] if not x["done"])
+        if s.get("when"):
+            verdict = _when_verdict(u, units)
+            if verdict is None:
+                return _halt(ctx, u, 2, later,
+                             why="its condition depends on step %d's output, which this "
+                                 "run did not record." % s["when"]["step"])
+            if not verdict:
+                print("    SKIPPED: step %d (%s) did not report /%s/"
+                      % (s["when"]["step"], s["when"]["id"], s["when"]["regex"]))
+                _rjournal({"event": "step_done", "run_id": run_id, "play": pk, "step": n,
+                           "digest": u["digest"], "status": "skipped",
+                           "why": "condition not met: %s reports /%s/"
+                                  % (s["when"]["id"], s["when"]["regex"])})
+                u["done"] = "skipped"
+                continue
+        _rjournal({"event": "step_started", "run_id": run_id, "play": pk, "step": n,
+                   "digest": u["digest"]})
+        ctx["ran"] += 1
+        problem, rc, out = _run_unit(u, run, run_id, ctx["contract"], sleep)
+        u["reports"] = _reports(u, out)
+        ok = rc == 0 and not problem
+        _rjournal({"event": "step_done", "run_id": run_id, "play": pk, "step": n,
+                   "digest": u["digest"], "status": "ok" if ok else "failed", "rc": rc,
+                   "reports": u["reports"]})
+        if "lock retained" in out.lower():
+            _notify(ctx, "lock_retained", at=_where(ctx, u), rc=rc, resume=ctx["resume"])
+        if problem == "not-read":
+            return _halt(ctx, u, 2, later,
+                         why="the door did not run it as a read (policy may classify "
+                             "it differently) — nothing ran for it.")
+        if not ok:
+            return _halt(ctx, u, rc, later, out=out)
+        u["done"] = "ok"
+    _rjournal({"event": "run_complete", "run_id": run_id, "kind": ctx["kind"],
+               "name": ctx["name"]})
+    print("\n%s COMPLETE — %d step(s). The agent reads it with: vpsexec last -n %d"
+          % (ctx["kind"].upper(), total, max(ctx["ran"], 1)))
+    _notify(ctx, "finish", steps=total, ran=ctx["ran"])
+    return 0
+
+
+def _choose_grant(label, to_run, contract, load_grant, release=None):
+    """One grant for every break-glass step that will run. Marks those units
+    `bg` and returns (contract, picked, break-glass step numbers)."""
+    combined = {"path": label, "steps": [u["step"] for u in to_run]}
+    plans = [(u["text"], u["digest"]) for u in to_run]
+    picked = None
+    if contract in (None, AUTO):
+        contract = None
+        bg = [k for k, (text, _) in enumerate(plans, 1) if BREAK_GLASS_RE.search(text)]
+        found = auto_pick(combined, plans, bg, release=release) if bg else None
+        if found:
+            contract, picked = found
+    bg_steps = contract_coverage(combined, plans, contract, load_grant)
+    for k, u in enumerate(to_run, 1):
+        u["bg"] = k in bg_steps
+    return contract, picked, bg_steps
+
+
+BODY_LINE_RE = re.compile(r"^      ")
+COLLAPSE_AFTER = 15
+
+
+def _collapse_bodies(text, full):
+    """An action step's body (docs/ACTIONS.md: "the full body... collapsed
+    after 15 lines, --full expands") is what the plan-hash binds either way;
+    collapsing here only shortens what scrolls past before approval."""
+    if full:
+        return text
+    lines, out, i = text.splitlines(), [], 0
+    while i < len(lines):
+        out.append(lines[i])
+        if lines[i] == "    body:":
+            i += 1
+            body = []
+            while i < len(lines) and BODY_LINE_RE.match(lines[i]):
+                body.append(lines[i])
+                i += 1
+            if len(body) > COLLAPSE_AFTER:
+                out += body[:COLLAPSE_AFTER]
+                out.append("      ... %d more line(s) — vpsrun --full shows the body "
+                           "in full (the hash binds all of it either way)"
+                           % (len(body) - COLLAPSE_AFTER))
+            else:
+                out += body
+            continue
+        i += 1
+    return "\n".join(out)
+
+
+def _show(units, ctx):
+    full = ctx.get("full", False)
+    for u in units:
+        s = u["step"]
+        print("=" * 72)
+        if ctx["kind"] == "release":
+            print("PLAY %s — STEP %d of %d — %s"
+                  % (_play_name(u["play"]), u["n"], len(u["play"]["steps"]), s["why"]))
+        else:
+            print("STEP %d of %d — %s" % (u["n"], len(units), s["why"]))
+        if u["done"]:
+            print("ALREADY %s in run %s — will NOT run again (plan %s)"
+                  % ("DONE" if u["done"] == "ok" else "SKIPPED", ctx["run_id"],
+                     u["digest"][:12]))
+            continue
+        if s.get("when"):
+            print("OPTIONAL — runs only if step %d (%s) reports /%s/; otherwise "
+                  "skipped and journaled" % (s["when"]["step"], s["when"]["id"],
+                                             s["when"]["regex"]))
+        print(printable(_collapse_bodies(u["text"], full).rstrip()))
+    print("=" * 72)
+
+
+def _print_grant(contract, picked, bg_steps):
     if bg_steps:
         print("contract: %s covers break-glass step(s) %s"
               % (contract, ", ".join(map(str, bg_steps))))
-    want = phrase(play, [d for _, d in plans])
+    if picked:
+        print("grant  : auto-picked %s %s  code %s  (expires %s)%s"
+              % (picked["kind"], _short_id(picked["session_id"]), picked["code"],
+                 picked["until"], "" if picked["left"] is None
+                 else "  %d use(s) left" % picked["left"]))
+        if picked["ties"]:
+            print("         %d other grant(s) ranked equal (%s); picked the lowest "
+                  "session id" % (len(picked["ties"]),
+                                  ", ".join(_short_id(t) for t in picked["ties"])))
+
+
+def _ask(prompt, stream, want, count):
     from vpscfg import vpsexecgrant
-    vpsexecgrant.flush_input(stream)  # stray keys must not answer the play prompt
+    vpsexecgrant.flush_input(stream)  # stray keys must not answer the prompt
     if prompt("Type %s to run all %d step(s) in order, anything else aborts: "
-              % (want, len(plans))).strip() != want:
+              % (want, count)).strip() != want:
         raise Refused("approval text did not match %r — nothing ran" % want)
 
+
+def _asker(prompt, stream):
+    """The TTY prompt resume uses to settle a reconciled step. One answer per
+    question per invocation (a release re-plans after minting a grant)."""
+    answers = {}
+
+    def ask(msg):
+        if msg not in answers:
+            from vpscfg import vpsexecgrant
+            vpsexecgrant.flush_input(stream)
+            answers[msg] = prompt(msg)
+        return answers[msg]
+    return ask
+
+
+def _operator():
+    from vpscfg import vpsexecgrant
+    return vpsexecgrant.operator()  # the password database, never $USER
+
+
+def _require_tty(stream, what):
+    if not (hasattr(stream, "isatty") and stream.isatty()):
+        raise Refused("vpsrun needs a real terminal. It is how a HUMAN approves a "
+                      "%s; open a terminal (not `!`) and run it there." % what)
+
+
+def _grant_record(picked, bg_steps):
+    return {"auto": True, "kind": picked["kind"], "session_id": picked["session_id"],
+            "approval_code": picked["code"], "break_glass_steps": bg_steps}
+
+
+def _start_run(kind, name, resume):
+    """(run id, resumed). A new run is journaled only once it is approved, so
+    an aborted approval leaves nothing for --resume to pick up."""
+    if resume:
+        return find_resumable(kind, name), True
+    return new_run_id(), False
+
+
+def _journal_start(kind, name, run_id, resumed, extra):
+    _rjournal(dict({"event": "run_resumed" if resumed else "run_started",
+                    "run_id": run_id, "kind": kind, "name": name}, **extra))
+
+
+def run_play(play, run, prompt, stream, check=None, contract=None, load_grant=None,
+             resume=False, sleep=None, notify=None, full=False):
+    _require_tty(stream, "play")
+    name = _key(play)
+    run_id, resumed = _start_run("play", name, resume)
+    units = prepare([play], run, run_id, check)
+    if resumed:
+        resume_plan(units, run_id, ask=_asker(prompt, stream))
+    to_run = [u for u in units if not u["done"]]
+    contract, picked, bg_steps = _choose_grant(play["path"], to_run, contract, load_grant)
+    ctx = {"kind": "play", "name": name, "run_id": run_id, "contract": contract,
+           "prompt": prompt, "stream": stream, "sleep": sleep, "notify": notify,
+           "full": full, "resume": "vpsrun %s --resume" % shlex.quote(play["path"])}
+    _show(units, ctx)
+    print("play   : %s  (sha256 %s)" % (play["path"], play["sha256"][:16]))
+    print("reason : %s" % play["reason"])
+    print("run    : %s%s" % (run_id, "  (RESUMED — done steps are not run again)"
+                             if resumed else ""))
+    _print_grant(contract, picked, bg_steps)
+    if not to_run:
+        print("Nothing left to run in run %s." % run_id)
+        if resumed:
+            _rjournal({"event": "run_complete", "run_id": run_id, "kind": "play",
+                       "name": name})
+        return 0
+    want = (phrase(play, [u["digest"] for u in units]) if not resumed
+            else run_phrase("PLAY", [u["step"] for u in to_run],
+                            [u["digest"] for u in to_run]))
+    _ask(prompt, stream, want, len(to_run))
+    _journal_start("play", name, run_id, resumed, {"play_sha256": play["sha256"]})
+
     from vpscfg import journal
-    journal.append("vpsexec", {
+    approved = {
         "event": "play_approved", "play": play["path"], "play_sha256": play["sha256"],
-        "reason": play["reason"], "steps": [d for _, d in plans],
-        "operator": os.environ.get("USER", "unknown")})
-    for n, (s, (_, digest)) in enumerate(zip(play["steps"], plans), 1):
-        print("")
-        print(">>> STEP %d of %d — %s" % (n, len(plans), s["why"]))
-        if n in reads:
-            # A plain read: the same argv a human would type, with no --run,
-            # --approve or contract. Without --run the door executes nothing
-            # that is not a read, so a step it judges otherwise ran nothing.
-            rc, out = run(step_argv(play, n, s))
-            print(printable(out.rstrip()))
-            tier = TIER_RE.search(out)
-            if rc == 0 and (tier is None or tier.group(1) != "read"):
-                print("\nPLAY HALTED at step %d: the door did not run it as a read "
-                      "(policy may classify it differently) — nothing ran for it. "
-                      "%d later step(s) NOT run." % (n, len(plans) - n))
-                return 2
-        else:
-            extra = ["--approval-contract=" + contract] if n in bg_steps else []
-            rc, out = run(step_argv(play, n, s) + ["--run", "--approve=" + digest] + extra)
-            print(printable(out.rstrip()))
+        "reason": play["reason"], "steps": [u["digest"] for u in to_run],
+        "operator": _operator(), "run_id": run_id,
+        "resumed": resumed}
+    if picked:
+        approved["grant"] = _grant_record(picked, bg_steps)
+    journal.append("vpsexec", approved)
+    return execute_units(units, run, ctx)
+
+
+# ---------------------------------------------------------------------------
+# releases: releases/NAME.yaml — plays in order, one phrase
+# ---------------------------------------------------------------------------
+
+RELEASE_KEYS = {"version", "reason", "plays", "policies", "grant_ttl", "on_fail"}
+RELEASE_ENTRY_KEYS = {"play", "hold_before"}
+ON_FAIL_KEYS = {"runbook", "step"}
+DEFAULT_GRANT_TTL = "12h"
+
+
+def _named(what, name, directory):
+    name = str(name)
+    if not NAME_RE.match(name) or ".." in name:
+        raise Refused("%s name %r: 1-64 of [A-Za-z0-9._-], starting with a letter or "
+                      "digit (no paths)" % (what, name))
+    return Path(directory) / (name if name.endswith((".yaml", ".yml")) else name + ".yaml")
+
+
+def _rollback_offer(release_name, entry, n, policy_dir):
+    """A rollback runbook entry, rendered as the exact vpsexec command to type.
+    Printed when a release halts; never run by vpsrun."""
+    import yaml
+    from vpscfg.vpsexecpolicy import ROLLBACK_MARK
+    if not isinstance(entry, dict) or set(entry) != ON_FAIL_KEYS:
+        raise Refused("on_fail %d: exactly {runbook: <policy file>, step: <n>}" % n)
+    path = _named("on_fail %d runbook" % n, entry["runbook"], policy_dir)
+    if not path.exists():
+        # An action policy lives in policies/actions/ (docs/ACTIONS.md); a
+        # release names it by its bare file name, as _release_policy_paths reads.
+        alt = _named("on_fail %d runbook" % n, entry["runbook"], Path(policy_dir) / "actions")
+        if alt.exists():
+            path = alt
+    step = entry["step"]
+    if isinstance(step, bool) or not isinstance(step, int) or step < 1:
+        raise Refused("on_fail %d: step must be a runbook entry number (1-based)" % n)
+    try:
+        doc = yaml.safe_load(path.read_bytes())
+    except (OSError, yaml.YAMLError) as e:
+        raise Refused("on_fail %d: cannot read %s (%s)" % (n, path, e))
+    books = (doc or {}).get("runbooks") if isinstance(doc, dict) else None
+    if not isinstance(books, list) or step > len(books) or not isinstance(books[step - 1], dict):
+        raise Refused("on_fail %d: %s has no runbook entry %d" % (n, path.name, step))
+    rb = books[step - 1]
+    if not (rb.get("rollback") is True or ROLLBACK_MARK in str(rb.get("why", "")).lower()):
+        raise Refused("on_fail %d: %s entry %d is not a rollback entry (rollback: true)"
+                      % (n, path.name, step))
+    hosts = rb.get("hosts", rb.get("host"))
+    hosts = [hosts] if isinstance(hosts, str) else hosts
+    is_action = "action" in rb
+    if not isinstance(hosts, list) or not hosts or not (
+            is_action or str(rb.get("cmd") or "").strip()):
+        raise Refused("on_fail %d: %s entry %d has no hosts or cmd" % (n, path.name, step))
+    argv = ["vpsexec", ",".join(_clean("on_fail host", h) for h in hosts)]
+    if is_action:
+        with_value = rb.get("with") or {}
+        if not isinstance(with_value, dict):
+            raise Refused("on_fail %d: %s entry %d with: is not a mapping" % (n, path.name, step))
+        argv += ["--action", _clean("on_fail action", rb["action"]),
+                 "--with", _clean("on_fail with", json.dumps(with_value, sort_keys=True))]
+    else:
+        argv.append(_clean("on_fail cmd", rb["cmd"]))
+    if rb.get("where") == "container":
+        if not rb.get("container"):
+            raise Refused("on_fail %d: %s entry %d runs in a container it does not name "
+                          "— vpsrun cannot print an exact command for it" % (n, path.name, step))
+        argv.append("--in=" + _clean("on_fail container", rb["container"]))
+    if rb.get("break_glass"):
+        argv.append("--break-glass")
+    argv += ["--run", "--reason", "rollback after release %s halted" % release_name]
+    return {"runbook": path.name, "step": step,
+            "command": " ".join(shlex.quote(a) for a in argv)}
+
+
+def load_release(name, release_dir=None, play_dir=None, policy_dir=None):
+    import yaml
+    from vpscfg import vpsexecgrant
+    path = _named("release", name, release_dir or RELEASE_DIR)
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        raise Refused("no release %s (%s)" % (path, e.strerror or e))
+    doc = yaml.safe_load(raw)
+    if not isinstance(doc, dict) or doc.get("version") != 1:
+        raise Refused("%s: not a version-1 release" % path)
+    unknown = sorted(set(doc) - RELEASE_KEYS)
+    if unknown:
+        raise Refused("%s: unknown key(s) %r" % (path, unknown))
+    reason = _clean("release reason", doc.get("reason") or "").strip()
+    if not reason:
+        raise Refused("%s: a release needs a reason" % path)
+    entries = doc.get("plays")
+    if not isinstance(entries, list) or not entries:
+        raise Refused("%s: plays must be a non-empty list" % path)
+    plays, holds, seen = [], {}, set()
+    for n, e in enumerate(entries, 1):
+        if isinstance(e, str):
+            e = {"play": e}
+        if not isinstance(e, dict) or "play" not in e or set(e) - RELEASE_ENTRY_KEYS:
+            raise Refused("%s: plays entry %d must be a play name or {play: NAME, "
+                          "hold_before: \"what the human checks\"}" % (path, n))
+        try:
+            play = load_play(_named("play", e["play"], play_dir or PLAY_DIR))
+        except OSError as err:
+            raise Refused("%s: play %s: %s" % (path, e["play"], err.strerror or err))
+        if _key(play) in seen:
+            raise Refused("%s: play %s is listed twice — a release runs each play once"
+                          % (path, e["play"]))
+        seen.add(_key(play))
+        if "hold_before" in e:
+            hold = _clean("hold_before", e["hold_before"] or "").strip()
+            if not hold:
+                raise Refused("%s: hold_before on %s needs the question the human "
+                              "answers" % (path, e["play"]))
+            holds[_key(play)] = hold
+        plays.append(play)
+    policies = doc.get("policies") or []
+    if not isinstance(policies, list) or not all(
+            isinstance(p, str) and NAME_RE.match(p) for p in policies):
+        raise Refused("%s: policies must be a list of policy file names" % path)
+    ttl = str(doc.get("grant_ttl") or DEFAULT_GRANT_TTL)
+    if ttl not in vpsexecgrant.REUSABLE_TTLS:
+        raise Refused("%s: grant_ttl %r is not a reusable-grant TTL (%s)"
+                      % (path, ttl, ", ".join(vpsexecgrant.REUSABLE_TTLS)))
+    stem = path.stem
+    pdir = policy_dir or _estate.current().policies
+    on_fail = doc.get("on_fail") or []
+    if not isinstance(on_fail, list):
+        raise Refused("%s: on_fail must be a list" % path)
+    offers = [_rollback_offer(stem, o, n, pdir) for n, o in enumerate(on_fail, 1)]
+    return {"name": stem, "path": str(path), "sha256": hashlib.sha256(raw).hexdigest(),
+            "reason": reason, "plays": plays, "holds": holds, "policies": policies,
+            "grant_ttl": ttl, "on_fail": offers}
+
+
+def bg_scope(to_run):
+    """(hosts, count) of the break-glass steps that will run, as the door
+    resolved each plan: a release mints a grant for exactly those (H4b)."""
+    hosts, count = [], 0
+    for u in to_run:
+        if not BREAK_GLASS_RE.search(u["text"]):
+            continue
+        count += 1
+        m = PLAN_HOSTS_RE.search(u["text"])
+        for h in (m.group(1).split(",") if m else []):
+            h = h.strip()
+            if h and h not in hosts:
+                hosts.append(h)
+    return hosts, count
+
+
+def mint_argv(release, hosts=None, uses=None):
+    """The door's `grant new` for this release: its policies, narrowed to the
+    hosts its break-glass steps reach and to one use per such step, bound to
+    this release (only it auto-picks the grant) and revoked when it completes."""
+    argv = ["grant", "new", ",".join(release["policies"]), "--kind", "reusable",
+            "--ttl", release["grant_ttl"]]
+    if hosts:
+        argv += ["--hosts", ",".join(hosts)]
+    if uses:
+        argv += ["--max-uses", str(uses)]
+    return argv + ["--for-release", release["name"], "--run"]
+
+
+def _bound_ids(units, name):
+    return set(sid for u in units for sid, info in door_grants(u["text"]).items()
+               if info.get("release") == name)
+
+
+def _revoke_release_grants(sids, name):
+    """The run completed: the grants minted for it are spent, permanently."""
+    from vpscfg import vpsexecgrant
+    for sid in sorted(sids):
+        vpsexecgrant.revoke(sid)
+        print("grant  : %s revoked — release %s completed" % (_short_id(sid), name))
+
+
+def _door_mint(argv):
+    """The door's own `grant new`, on this terminal: it shows what the grant
+    authorises and asks for ITS phrase. vpsrun mints nothing itself."""
+    return subprocess.run(VPSEXEC + argv).returncode
+
+
+def _release_policy_paths(release, policy_dir=None):
+    pdir = policy_dir or _estate.current().policies
+    out = []
+    for name in release["policies"]:
+        p = Path(pdir) / name
+        if not p.exists():
+            p = Path(pdir) / "actions" / name
+        out.append(p)
+    return out
+
+
+def _gate_release(release, lint_fn, preflight_fn, policy_dir=None):
+    """Lint on save (D10): `vpsrun release NAME` runs lint plus --index-only
+    preflight on every policy before anything is planned. NO-GO refuses here,
+    before any phrase; GO-WITH-WARNINGS prints and continues."""
+    if not release["policies"]:
+        return
+    from vpscfg import releasenew
+    paths = _release_policy_paths(release, policy_dir)
+    rc, text = releasenew.gate(paths, lint_fn or releasenew.default_lint,
+                               preflight_fn or releasenew.default_preflight_index_only)
+    if rc == 2:
+        raise Refused("release %s: NO-GO on lint/preflight — nothing was planned:\n%s"
+                      % (release["name"], text))
+    if rc == 1:
+        print("GO-WITH-WARNINGS — release %s (continuing):\n%s" % (release["name"], text))
+
+
+def run_release(release, run, prompt, stream, check=None, contract=None,
+                load_grant=None, resume=False, sleep=None, notify=None, mint=None,
+                full=False, lint_fn=None, preflight_fn=None, policy_dir=None,
+                gate_release=False):
+    """`gate_release=True` (the `vpsrun release NAME` CLI always passes it) is
+    "lint on save" (D10): runs lint + --index-only preflight on every policy
+    before anything is planned. NO-GO refuses here, before any phrase;
+    GO-WITH-WARNINGS prints and continues. Default False keeps this a plain
+    plan-and-run function for callers (and tests) that gate separately."""
+    _require_tty(stream, "release")
+    name = release["name"]
+    label = "release %s" % name
+    if gate_release:
+        _gate_release(release, lint_fn, preflight_fn, policy_dir)
+    run_id, resumed = _start_run("release", name, resume)
+    ask = _asker(prompt, stream)
+
+    def plan(prechecks=True):
+        units = prepare(release["plays"], run, run_id, check, prechecks=prechecks)
+        if resumed:
+            resume_plan(units, run_id, ask=ask)
+        return units
+
+    units = plan()
+    to_run = [u for u in units if not u["done"]]
+    needs_grant = contract in (None, AUTO) and any(
+        BREAK_GLASS_RE.search(u["text"]) for u in to_run)
+    if needs_grant and not auto_pick(
+            {"path": label, "steps": [u["step"] for u in to_run]},
+            [(u["text"], u["digest"]) for u in to_run],
+            [k for k, u in enumerate(to_run, 1) if BREAK_GLASS_RE.search(u["text"])],
+            release=name):
+        hosts, uses = bg_scope(to_run)
+        argv = mint_argv(release, hosts, uses)
+        cmd = "vpsexec %s" % " ".join(shlex.quote(a) for a in (
+            argv if release["policies"]
+            else ["grant", "new", "<policy,...>", "--kind", "reusable", "--ttl",
+                  release["grant_ttl"], "--run"]))
+        if not release["policies"]:
+            raise Refused("this release has break-glass steps and no valid grant covers "
+                          "them all. Mint one reusable grant (%s), then re-run: vpsrun "
+                          "release %s. Nothing was run." % (cmd, name))
+        print("No valid grant covers this release's break-glass steps. Minting ONE "
+              "reusable grant through the door:\n  %s" % cmd)
+        print("The door shows what it authorises and asks for its own phrase; "
+              "anything else aborts and nothing runs.")
+        rc = (mint or _door_mint)(argv)
         if rc != 0:
-            rest = len(plans) - n
-            print("\nPLAY HALTED at step %d (rc=%s). %d later step(s) NOT run." % (n, rc, rest))
-            print("The agent can read what happened with: vpsexec last -n %d" % n)
-            return rc
-    print("\nPLAY COMPLETE — %d step(s). The agent reads it with: vpsexec last -n %d"
-          % (len(plans), len(plans)))
-    return 0
+            raise Refused("the grant was not minted (rc=%s) — nothing ran" % rc)
+        units = plan(prechecks=False)  # the door lists the new grant per plan
+        to_run = [u for u in units if not u["done"]]
+    contract, picked, bg_steps = _choose_grant(label, to_run, contract, load_grant,
+                                               release=name)
+    # Revoked when the run completes: every grant bound to this release that
+    # the door lists for its plans (the one just minted, or one from an earlier
+    # attempt this --resume picked up).
+    bound = _bound_ids(to_run, name)
+    ctx = {"kind": "release", "name": name, "run_id": run_id, "contract": contract,
+           "prompt": prompt, "stream": stream, "sleep": sleep, "notify": notify,
+           "full": full, "holds": release["holds"], "on_fail": release["on_fail"],
+           "resume": "vpsrun release %s --resume" % name}
+    _show(units, ctx)
+    print("release: %s  (sha256 %s)" % (release["path"], release["sha256"][:16]))
+    print("reason : %s" % release["reason"])
+    print("plays  : %s" % ", ".join(
+        "%s%s" % (_play_name(p), " (HOLD before)" if _key(p) in release["holds"] else "")
+        for p in release["plays"]))
+    print("run    : %s%s" % (run_id, "  (RESUMED — done steps are not run again)"
+                             if resumed else ""))
+    _print_grant(contract, picked, bg_steps)
+    if not to_run:
+        print("Nothing left to run in run %s." % run_id)
+        if resumed:
+            _rjournal({"event": "run_complete", "run_id": run_id, "kind": "release",
+                       "name": name})
+        return 0
+    want = run_phrase("RELEASE:%s" % name, [u["step"] for u in to_run],
+                      [u["digest"] for u in to_run])
+    _ask(prompt, stream, want, len(to_run))
+    _journal_start("release", name, run_id, resumed, {
+        "release_sha256": release["sha256"], "plays": [_key(p) for p in release["plays"]]})
+
+    from vpscfg import journal
+    approved = {"event": "release_approved", "release": release["path"],
+                "release_sha256": release["sha256"], "reason": release["reason"],
+                "run_id": run_id, "resumed": resumed,
+                "plays": [{"play": u["play"]["path"], "play_sha256": u["play"]["sha256"],
+                           "step": u["n"], "plan": u["digest"]} for u in to_run],
+                "operator": _operator()}
+    if picked:
+        approved["grant"] = _grant_record(picked, bg_steps)
+    journal.append("vpsexec", approved)
+    ctx["replan"] = lambda play: prepare([play], run, run_id, check, prechecks=False)
+    rc = execute_units(units, run, ctx)
+    if rc == 0 and bound:
+        _revoke_release_grants(bound, name)
+    return rc
+
+
+def release_check(name, lint_fn=None, preflight_fn=None, policy_dir=None,
+                  release_dir=None, play_dir=None):
+    """`vpsrun release check NAME` = lint + full (live-capable) preflight,
+    read-only. Safe for the agent to run: it never plans or approves a step."""
+    from vpscfg import releasenew
+    release = load_release(name, release_dir, play_dir, policy_dir)
+    paths = _release_policy_paths(release, policy_dir)
+    rc, text = releasenew.gate(paths, lint_fn or releasenew.default_lint,
+                               preflight_fn or releasenew.default_preflight_live)
+    print(text)
+    print("VERDICT: %s" % releasenew.VERDICT_NAME[rc])
+    return rc
 
 
 def _vpscfg_run(argv):
@@ -387,19 +1795,39 @@ def _vpscfg_run(argv):
     return r.returncode, r.stdout + r.stderr
 
 
-def _subprocess_run(argv):
-    r = subprocess.run(VPSEXEC + argv, capture_output=True, text=True)
-    return r.returncode, r.stdout + r.stderr
+PROGRESS_EVERY = 15  # seconds between "still running" lines for a long step
+
+
+def _subprocess_run(argv, popen=None, clock=time.monotonic, err=None,
+                    every=PROGRESS_EVERY):
+    """The door, as a child. A step that takes longer than `every` seconds
+    prints a "still running" line with its elapsed time (L8), so a long
+    recreate is visibly alive; the door's full output follows when it ends."""
+    p = (popen or subprocess.Popen)(VPSEXEC + argv, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+    err = err or sys.stderr
+    start = clock()
+    while True:
+        try:
+            out, errs = p.communicate(timeout=every)
+            break
+        except subprocess.TimeoutExpired:
+            err.write("  ... still running (%ds) — %s\n"
+                      % (int(clock() - start), " ".join(argv[:2])[:80]))
+            err.flush()
+    return p.returncode, (out or "") + (errs or "")
 
 
 def parse_argv(argv):
-    """`PLAY [--approval-contract[=]FILE]` -> (play path, absolute contract or None)."""
+    """`PLAY [--approval-contract[=]FILE|auto]` (alias `--grant`) -> (play path,
+    absolute contract, AUTO, or None). None and AUTO both auto-pick."""
     positional, contract, i = [], None, 0
     while i < len(argv):
         a = argv[i]
-        if a.startswith("--approval-contract="):
+        flag = a.split("=", 1)[0]
+        if flag in ("--approval-contract", "--grant") and "=" in a:
             contract = a.split("=", 1)[1]
-        elif a == "--approval-contract":
+        elif a in ("--approval-contract", "--grant"):
             if i + 1 >= len(argv):
                 raise Refused("--approval-contract needs a file path")
             contract = argv[i + 1]
@@ -414,31 +1842,127 @@ def parse_argv(argv):
     if contract is not None:
         if not contract.strip():
             raise Refused("--approval-contract needs a file path")
+        if contract.strip() == AUTO:
+            return positional[0], AUTO
         contract = os.path.abspath(os.path.expanduser(contract))
     return positional[0], contract
+
+
+def parse_cli(argv):
+    """`[release] TARGET [--resume] [--approval-contract=FILE|auto]` ->
+    (mode, target, contract, resume)."""
+    mode = "play"
+    if len(argv) > 1 and argv[0] == "release":
+        mode, argv = "release", argv[1:]
+    resume = "--resume" in argv
+    target, contract = parse_argv([a for a in argv if a != "--resume"])
+    return mode, target, contract, resume
+
+
+def parse_release_new_argv(argv):
+    """`release new NAME --from POLICY[,POLICY...] [--replace]` ->
+    (name, from_arg, replace)."""
+    positional, from_arg, replace, i = [], None, False, 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--from="):
+            from_arg = a.split("=", 1)[1]
+        elif a == "--from":
+            if i + 1 >= len(argv):
+                raise Refused("--from needs a policy.yaml[,policy.yaml...]")
+            from_arg = argv[i + 1]
+            i += 1
+        elif a == "--replace":
+            replace = True
+        elif a.startswith("-"):
+            raise Refused("unknown flag %r" % a)
+        else:
+            positional.append(a)
+        i += 1
+    if len(positional) != 1 or not from_arg:
+        raise Refused("usage: vpsrun release new NAME --from "
+                      "policy.yaml[,policy.yaml...] [--replace]")
+    return positional[0], from_arg, replace
 
 
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         queued = sorted(PLAY_DIR.glob("*.yaml")) if PLAY_DIR.is_dir() else []
+        releases = sorted(RELEASE_DIR.glob("*.yaml")) if RELEASE_DIR.is_dir() else []
         print(__doc__.split("\n\n")[0])
         print("\n  vpsrun plays/NAME.yaml     show every step, type one phrase, run")
+        print("                             break-glass steps: a valid grant covering")
+        print("                             all of them is auto-picked from ~/.vpscfg/grants")
         print("  vpsrun plays/NAME.yaml --approval-contract=FILE")
-        print("                             break-glass steps: a grant covering each one")
+        print("                             or name one grant yourself")
+        print("  vpsrun release NAME        every play in releases/NAME.yaml, one phrase")
+        print("  ... --resume               continue the latest unfinished run: steps")
+        print("                             that already succeeded are not run again")
+        print("  ... --full                 show every action step's body in full "
+              "(plan review collapses it after 15 lines)")
+        print("  vpsrun release new NAME --from policy.yaml[,policy.yaml...] [--replace]")
+        print("                             scaffold plays/ and releases/ from a runbook; "
+              "writes nothing under policies/, mints nothing, never --run")
+        print("  vpsrun release check NAME  lint + full preflight, read-only")
         print("\nQueued plays:" if queued else "\nNo plays queued in plays/.")
         for p in queued:
             print("  %s" % p.relative_to(PLAY_DIR.parent))  # the estate root, not REPO
+        if releases:
+            print("\nReleases:")
+            for p in releases:
+                print("  vpsrun release %s" % p.stem)
         return 0
+    from vpscfg import gates, releasenew
+    mode, target = "play", None
     try:
-        path, contract = parse_argv(argv)
-        return run_play(load_play(path), _subprocess_run,
-                        lambda msg: input(msg), sys.stdin, contract=contract)
-    except Refused as r:
+        if len(argv) > 1 and argv[0] == "release" and argv[1] == "new":
+            name, from_arg, replace = parse_release_new_argv(argv[2:])
+            mode, target = "release-new", name
+            result = releasenew.new(name, from_arg, replace=replace)
+            for p in result["plays"]:
+                print("play    : %s" % p)
+            print("release : %s" % result["release"])
+            print(result["report"])
+            print("VERDICT: %s" % result["verdict"])
+            return result["exit_code"]
+        if len(argv) > 1 and argv[0] == "release" and argv[1] == "check":
+            if len(argv) != 3:
+                raise Refused("usage: vpsrun release check NAME")
+            mode, target = "release-check", argv[2]
+            return release_check(target)
+        full = "--full" in argv
+        mode, target, contract, resume = parse_cli([a for a in argv if a != "--full"])
+        if mode == "release":
+            return run_release(load_release(target), _subprocess_run,
+                               lambda msg: input(msg), sys.stdin, contract=contract,
+                               resume=resume, full=full, gate_release=True)
+        return run_play(load_play(target), _subprocess_run,
+                        lambda msg: input(msg), sys.stdin, contract=contract,
+                        resume=resume, full=full)
+    except (Refused, gates.Refused) as r:
         print("REFUSED: %s" % r, file=sys.stderr)
+        _notify_outside_run("refused", mode, target, why=str(r))
         return 2
     except (KeyboardInterrupt, EOFError):
-        print("\naborted — nothing further ran", file=sys.stderr)
+        print("\naborted — nothing further ran. An unfinished run continues with "
+              "--resume.", file=sys.stderr)
+        _notify_outside_run("aborted", mode, target)
         return 130
+
+
+def _notify_outside_run(event, mode, target, why=None, send=None):
+    """A refusal (planning, approval, resume) or a Ctrl-C reaches the human
+    too (L8). The reason travels as its first line only, masked: never the
+    door's plan or output."""
+    from vpscfg import notify, secretmask
+    fields = {"kind": mode, "name": str(target)[:200] if target else None}
+    if why:
+        first = (why.strip().splitlines() or [""])[0]
+        fields["why"] = secretmask.mask(first)[:300]
+    try:
+        (send or notify.send)(event, fields)
+    except Exception:  # a notifier never changes the exit status
+        pass
 
 
 if __name__ == "__main__":

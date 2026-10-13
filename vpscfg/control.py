@@ -216,5 +216,25 @@ def _validate(policy):
     if not isinstance(policy.get("scopes", {}).get("unlocked", None), list):
         problems.append("scopes.unlocked must be a list")
     problems.extend(_alias_problems(policy.get("hosts", {})))
+    # Hosts WITHOUT systemd on which detached vpsexec steps may still run: the
+    # governor's explicit acceptance that a process a step starts in a session
+    # of its own escapes every stop there (docs/VPSEXEC.md, "Detached steps").
+    unmanaged = policy.get("allow_unmanaged_steps")
+    if unmanaged is not None:
+        hosts = policy.get("hosts", {}) or {}
+        if not isinstance(unmanaged, list) or not all(
+                isinstance(h, str) and isinstance(hosts.get(h), dict)
+                and not hosts[h].get("alias_of") for h in unmanaged):
+            problems.append("allow_unmanaged_steps must be a list of governed, canonical "
+                            "(non-alias) host names")
+    # The remote branch reusable grants are bound to (docs/VPSEXEC.md,
+    # "Reusable grants are bound to pushed policy"); default origin/main.
+    remote = policy.get("policy_remote")
+    if remote is not None:
+        from .gitcmd import valid_remote
+        if (not isinstance(remote, dict) or set(remote) != {"name", "ref"}
+                or not valid_remote(remote.get("name"), remote.get("ref"))):
+            problems.append("policy_remote must be {\"name\": <remote>, \"ref\": <branch>} "
+                            "with plain names (default origin/main)")
     if problems:
         raise Refused("control policy failed validation: " + "; ".join(problems))

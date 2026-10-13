@@ -113,6 +113,11 @@ class _Harness(unittest.TestCase):
         self._real_load = vpsexec.sshconfig.load
         self._real_machines = vpsexec.sshconfig.machines
         journal.JOURNAL_DIR = Path(self.tmp.name)
+        # A break-glass plan with no contract flag searches the grants dir for
+        # one to auto-pick: never the operator's real ~/.vpscfg/grants.
+        self._real_grants = (vpsexecgrant.GRANT_DIR, vpsexecgrant.KEY_PATH)
+        vpsexecgrant.GRANT_DIR = Path(self.tmp.name) / "no-grants" / "grants"
+        vpsexecgrant.KEY_PATH = Path(self.tmp.name) / "no-grants" / "grant.key"
         telemetry.push_event = lambda *a, **k: False
         vpsexec.sshconfig.load = lambda *a, **k: dict((h, {}) for h in self.ALIASES)
         vpsexec.sshconfig.machines = lambda *a, **k: dict(
@@ -122,6 +127,7 @@ class _Harness(unittest.TestCase):
 
     def tearDown(self):
         journal.JOURNAL_DIR = self._real_dir
+        vpsexecgrant.GRANT_DIR, vpsexecgrant.KEY_PATH = self._real_grants
         telemetry.push_event = self._real_push
         vpsexec.sshconfig.load = self._real_load
         vpsexec.sshconfig.machines = self._real_machines

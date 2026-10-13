@@ -1,0 +1,11 @@
+# TEMPLATE. Not installed by anything in this repo. Every 12 hours.
+[Unit]
+Description=Run the vpscfg host index every 12 hours
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

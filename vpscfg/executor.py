@@ -70,6 +70,11 @@ class NotReleased(Refused):
     pass
 
 
+# The longest any single executor step may run (local build/save, the image
+# import). `vpsexec reconcile` derives how old an unproven lock must be from it.
+MAX_STEP_SECONDS = 1800
+
+
 def apply(guard, contract, verb, host, scope, planned_commands, reason=None,
           ssh=None, run_local=None, checks=None, latest_backup=None,
           preflight=None, event_sink=None, require_backup=False, ssh_stdin=None):
@@ -191,7 +196,7 @@ def _restore(guard, contract, host, ssh, backup):
         _step("rollback", host, "build", rc, err or out)
 
 
-def _default_ssh_stdin(host, cmd, path, timeout=1800):
+def _default_ssh_stdin(host, cmd, path, timeout=MAX_STEP_SECONDS):
     """Stream a local file into a fixed remote command's stdin (image import:
     no tarball ever lands on the host)."""
     with open(path, "rb") as f:
@@ -315,7 +320,7 @@ def _fire_k3s(guard, contract, verb, host, scope, ssh, run_local, ssh_stdin, che
         for name, argv in (("build", k3sapply.build_argv(contract, ref)),
                            ("save", k3sapply.save_argv(ref, tar))):
             deny_scan(" ".join(argv), deny)
-            rc, out, err = run_local(argv, timeout=1800)
+            rc, out, err = run_local(argv, timeout=MAX_STEP_SECONDS)
             _step(verb, host, name, rc, err or out)
         report("image-built", image=ref)
         # The tag names the commit + sources read BEFORE the build; if either
@@ -370,7 +375,7 @@ def _fire(guard, contract, verb, host, scope, planned, reason,
     latest_backup = latest_backup or probe.latest_backup
     service = contract["service"]
     deploy_dir = contract.get("deploy_dir")  # absent for k3s contracts
-    operator = os.environ.get("USER", "unknown")
+    operator = journal.operator()  # the password database, never $USER
     sink = event_sink or (lambda event: None)
     def report(name, ok=True, **data):
         event = {"step": name, "ok": ok, **data}
@@ -501,7 +506,8 @@ def _fire(guard, contract, verb, host, scope, planned, reason,
     finally:
         original_error = sys.exc_info()[1]
         if retain_lock:
-            print('  [BLOCKED] lock retained; reconcile operation %s before further mutation' % token)
+            print('  [BLOCKED] lock retained; reconcile operation %s before further mutation'
+                  ' — next: vpsexec reconcile %s' % (token, host))
             try:
                 report('lock-retained', ok=False, operation_id=token)
             except Exception as exc:

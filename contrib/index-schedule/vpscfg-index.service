@@ -1,0 +1,20 @@
+# TEMPLATE. Not installed by anything in this repo.
+# Indexes every governed host through the outer door. Run by vpscfg-index.timer.
+# Replace /path/to/vpscfgfarm and the user. Install as a user unit:
+#   cp vpscfg-index.service vpscfg-index.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now vpscfg-index.timer
+[Unit]
+Description=vpscfg host index (read-only) for every governed host
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/vpscfgfarm
+# The door BY PATH: its pinned shebang (tools/pin-interpreter.sh) names the one
+# real interpreter, with -I. Never `python3 <door>`: that lets PATH and the
+# environment choose the interpreter.
+ExecStart=/path/to/vpscfgfarm/vpscfg-control.py index --all
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE. Not installed by anything in this repo.
+  Indexes every governed host every 12 hours through the outer door.
+  Replace /path/to/vpscfgfarm with the absolute path of your checkout and
+  /path/to/log with a directory you own, then:
+    cp local.vpscfg.index.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.vpscfg.index.plist
+  It runs as you, so it uses your ~/.ssh/config and keys (BatchMode: no prompts).
+  The door runs BY PATH: its pinned shebang (tools/pin-interpreter.sh) names
+  the one real interpreter, with -I. Never /usr/bin/python3 <door>: on macOS
+  that is an xcrun shim the environment can redirect.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.vpscfg.index</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/vpscfgfarm/vpscfg-control.py</string>
+    <string>index</string>
+    <string>--all</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/path/to/vpscfgfarm</string>
+  <key>StartInterval</key>
+  <integer>43200</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/path/to/log/vpscfg-index.log</string>
+  <key>StandardErrorPath</key>
+  <string>/path/to/log/vpscfg-index.log</string>
+</dict>
+</plist>

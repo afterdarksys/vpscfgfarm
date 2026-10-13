@@ -170,7 +170,7 @@ class ScanTest(TmpBase):
         self.assertEqual(r.calls, [])
 
     def test_exit_2_refused_with_masked_clipped_excerpt(self):
-        secret = "password=hunter2-super-secret"
+        secret = "password=" + "hunter2-super-secret"
         out = json.dumps({"refused": secret + " " + "x" * 5000})
         with self.assertRaises(Refused) as cm:
             iacgate.scan(str(self.src), runner=Runner(rc=2, out=out))
@@ -388,7 +388,7 @@ class FleetIacCliTest(TmpBase):
         self.assertIn("REFUSED", err)
 
     def test_json_format_prints_the_validated_report_masked(self):
-        finding = dict(FINDING, evidence="password: hunter2-very-secret")
+        finding = dict(FINDING, evidence="password: hunter2-" + "very-secret")
         rc, out, _ = self._fleet([str(self.src), "--format", "json"],
                                  Runner(rc=1, out=json.dumps(report("block", [finding]))))
         self.assertEqual(rc, 1)

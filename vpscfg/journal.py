@@ -47,6 +47,16 @@ def _read_snapshot(path):
         return stream.read()
 
 
+def operator():
+    """Who is acting: the password database's name for the real uid — never
+    $USER, $LOGNAME or anything else the environment can set."""
+    import pwd
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return "uid%d" % os.getuid()
+
+
 def append(stream, entry):
     if not stream or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in stream):
         raise ValueError('invalid journal stream')
@@ -54,7 +64,7 @@ def append(stream, entry):
     path = JOURNAL_DIR / ("%s.jsonl" % stream)
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "operator": os.environ.get("USER", "unknown"),
+        "operator": operator(),
         **entry,
     }
     # The chain link is system-owned: an entry that tried to carry its own

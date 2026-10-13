@@ -25,8 +25,8 @@ Threats:
     anywhere in it refuses; the target directory must be owned by the operator
     and not group/world-writable, and every ancestor must be owned by the
     operator or root and be either not group/world-writable or sticky); a
-    pointed estate whose governor, policies, contracts, playbooks, plays or
-    inventory files are symlinks or writable by others; extended ACLs (which
+    pointed estate whose governor, policies, contracts, playbooks, plays,
+    releases or inventory files are symlinks or writable by others; extended ACLs (which
     can grant write while the mode bits look clean) on the pointer, the root,
     the governor or policies/; a case-variant pointer (`Estate.Path`) that a
     case-sensitive reader and a case-insensitive file system would disagree
@@ -74,7 +74,7 @@ GOVERNOR_NAME = "vpscfg-control.json"
 POLICIES_NAME = "policies"
 # Every estate directory the package reads from a pointed estate. Each is
 # walked in full (no symlinks, operator-owned, not writable by others).
-READ_DIRS = ("policies", "contracts", "playbooks", "plays", "inventory")
+READ_DIRS = ("policies", "contracts", "playbooks", "plays", "releases", "inventory")
 MAX_POINTER_BYTES = 4096
 
 

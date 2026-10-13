@@ -20,6 +20,10 @@
   vpscfg <host> drill <service> --run --reason "why"
                                         mutation: canary, then compose down with no volume flag;
                                         a receipt is journaled only when both succeed
+  vpscfg drill detach <host>            plan the detached-step scratch drill (read-only)
+  vpscfg drill detach <host> --run --reason "why"
+                                        mutation: re-proves detach.py/lock.py/reconcile on a
+                                        host whose posture is test AND is in drill_hosts
   vpscfg <host> sql <db> 'SELECT …'     read-only; the credential stays on the host
   vpscfg <host> secret-put --from-pipe NAME PATH
                                         plan an allowlisted secret install (read-only)
@@ -54,6 +58,12 @@
   vpscfg fleet iac PATH [--fail-on LEVEL] [--format text|json]
                                         badfarm static IaC scan of a local path (read-only);
                                         exit 0 pass, 1 findings/incomplete, 2 refused
+  vpscfg index <host>|--all [--json|--yaml] [--section a,b] [--no-save]
+                                        index services, containers, ports, users, postgres,
+                                        redis, rabbitmq, traefik routers (read-only; cached)
+  vpscfg index diff <host>              what changed since the previous cached index
+  vpscfg index query '<expr>' [--json|--hosts]
+                                        jq-like query across every cached host index
   vpscfg lint                           contract quality floor (read-only)
   vpscfg module ...                     locked in v0; edit contracts/ in git
 
@@ -96,12 +106,22 @@ def _dispatch(argv):
         return _status(guard)
     if argv[0] == "fleet":
         return _fleet(argv[1:])
+    if argv[0] == "index":
+        return _index(argv[1:])
     if argv[0] == "lint":
         return lint.run()
     if argv[0] == "journal":
         return _journal_verify(argv[1:])
     if argv[0] == "map":
         return _map_show()
+    if argv[0] == "drill":
+        # vpscfg drill detach <host> — the automated scratch-host drill for
+        # the detached-step machinery (docs/RECOVERY.md). Distinct from
+        # `vpscfg <host> drill <service>` (the restore drill) below: that
+        # pattern only matches when argv[0] is a HOST name, never the literal
+        # word "drill".
+        from . import drilldetach
+        return drilldetach.cli(guard, argv[1:])
 
     # Verb-first grammar: from a directory whose .vpscfgfarm.map names a
     # service, the host and service are inferred — the map routes, the
@@ -609,8 +629,10 @@ def _fleet(rest):
     if what == "iac":
         from . import iacgate
         return iacgate.cli(rest[1:])
+    if what == "index":
+        return _index(rest[1:])
     if what != "hosts":
-        raise Refused("fleet %r not released in v0 (hosts, watch, baseline, changes, keys, secrets, escrow, firewall, k3s, never, dns, authkeys, coverage, health, twins, images, postgres, os, translate, iac)" % what)
+        raise Refused("fleet %r not released in v0 (hosts, watch, baseline, changes, keys, secrets, escrow, firewall, k3s, never, dns, authkeys, coverage, health, twins, images, postgres, os, translate, index, iac)" % what)
     machines = sshconfig.machines()
     print("fleet machines (from ~/.ssh/config):")
     for target, rec in sorted(machines.items()):
@@ -618,6 +640,30 @@ def _fleet(rest):
               % (target, rec["user"] or "-", ", ".join(sorted(rec["aliases"]))))
     print("(%d machines)" % len(machines))
     return 0
+
+
+def _index(rest):
+    """vpscfg index ... (also `vpscfg fleet index ...`). Read-only on every
+    host. The deny floor, the governor's deny patterns and the policies'
+    deny_extra/risky_extra gate every command; a policy set that cannot load
+    refuses the run rather than indexing ungated."""
+    from . import indexstore, integrations, vpsexecpolicy
+    guard = Guard.load()
+    deny = list(guard.deny_patterns())
+    pol = vpsexecpolicy.load(deny_patterns=deny)
+    governed = _governed_docker_hosts()
+    words = [a for a in rest if not a.startswith("--")]
+    aliases = ()
+    if words and words[0] not in ("diff", "query"):
+        known = sshconfig.load()
+        if known and words[0] not in known:
+            raise Refused("host %r is not an alias in ~/.ssh/config" % words[0])
+        aliases = next((sorted(n) for n in governed.values() if words[0] in n), ())
+    kwargs = {"deny_patterns": deny + list(pol.get("deny_extra", [])),
+              "risky_extra": list(pol.get("risky_extra", [])),
+              "traefik": integrations.traefik(), "aliases": aliases}
+    return indexstore.cli(rest, hosts_for_all=lambda: sorted(governed),
+                          collect_kwargs=kwargs)
 
 
 def _fleet_firewall(names):

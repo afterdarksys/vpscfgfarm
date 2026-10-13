@@ -1,0 +1,57 @@
+{
+  "action": "pg_dump",
+  "expansions": [
+    {
+      "assumes": [
+        {
+          "container": "pg-main",
+          "host": "web1"
+        }
+      ],
+      "body": "umask 077\nd='/var/backups/db1'\nf='/var/backups/db1'/'shop'-'rel-1.5'-d7261f5c.dump\ntest -d \"$d\" || { echo \"vpscfg: dest_dir does not exist\" >&2; exit 2; }\nif test -n \"$(find \"$d\" -maxdepth 0 \\( -perm -0002 -o -perm -1000 \\) -print)\"; then echo \"vpscfg: dest_dir is world-writable or sticky; refused\" >&2; exit 2; fi\nif test -e \"$f\"; then echo \"vpscfg: $f already exists; a dump is never overwritten\" >&2; exit 3; fi\nt=$(mktemp \"$d/.vpscfg-dump.XXXXXX\") || exit 4\nr=$(mktemp \"$d/.vpscfg-dump.XXXXXX\") || { rm -f \"$t\"; exit 4; }\ntrap 'rm -f \"$t\" \"$r\"' EXIT\ndocker exec -e PGDATABASE='shop' 'pg-main' sh -c 'if [ -n \"${POSTGRES_PASSWORD_FILE:-}\" ] && [ -r \"$POSTGRES_PASSWORD_FILE\" ]; then PGPASSWORD=$(cat \"$POSTGRES_PASSWORD_FILE\"); else PGPASSWORD=\"${POSTGRES_PASSWORD:-${POSTGRESQL_PASSWORD:-}}\"; fi; export PGPASSWORD; exec pg_dump -Fc --no-password -U \"${POSTGRES_USER:-${POSTGRESQL_USERNAME:-postgres}}\"' > \"$t\" || { echo \"vpscfg: pg_dump failed\" >&2; exit 4; }\ntest -s \"$t\" || { echo \"vpscfg: the dump is empty\" >&2; exit 5; }\ndocker exec -i 'pg-main' pg_restore --list < \"$t\" > /dev/null || { echo \"vpscfg: pg_restore --list cannot read the dump\" >&2; exit 6; }\nh=$(sha256sum < \"$t\" | cut -d \" \" -f 1)\ntest -n \"$h\" || { echo \"vpscfg: sha256sum failed\" >&2; exit 7; }\nprintf '%s  %s\\n' \"$h\" \"$f\" > \"$r\"\nchmod 0600 \"$t\" \"$r\"\nmv \"$r\" \"$f.sha256\" && mv \"$t\" \"$f\" || exit 8\necho \"vpscfg: dumped $(wc -c < \"$f\" | tr -d \" \") bytes to $f, sha256 $h\"",
+      "canonical": "vpscfg-action pg_dump@2 '{\"container\":\"pg-main\",\"db\":\"shop\",\"dest_dir\":\"/var/backups/db1\",\"label\":\"rel-1.5\"}'",
+      "check": "sha256sum --check --status '/var/backups/db1'/'shop'-'rel-1.5'-d7261f5c.dump.sha256 >/dev/null 2>&1 && echo VPSCFG-DONE || echo VPSCFG-NEEDED",
+      "idempotent": true,
+      "params": {
+        "container": "pg-main",
+        "db": "shop",
+        "dest_dir": "/var/backups/db1",
+        "label": "rel-1.5"
+      },
+      "tier": "mutation",
+      "timeout": 1800,
+      "verify": "sha256sum --check --status '/var/backups/db1'/'shop'-'rel-1.5'-d7261f5c.dump.sha256",
+      "verify_retry": null
+    },
+    {
+      "assumes": [
+        {
+          "container": "pg-main",
+          "host": "web1"
+        },
+        {
+          "host": "web1",
+          "min_free_gb": {
+            "/var/backups/db1": 5
+          }
+        }
+      ],
+      "body": "umask 077\nd='/var/backups/db1'\nf='/var/backups/db1'/'shop'-'rel-1.5'-d7261f5c.dump\ntest -d \"$d\" || { echo \"vpscfg: dest_dir does not exist\" >&2; exit 2; }\nif test -n \"$(find \"$d\" -maxdepth 0 \\( -perm -0002 -o -perm -1000 \\) -print)\"; then echo \"vpscfg: dest_dir is world-writable or sticky; refused\" >&2; exit 2; fi\nif test -e \"$f\"; then echo \"vpscfg: $f already exists; a dump is never overwritten\" >&2; exit 3; fi\nt=$(mktemp \"$d/.vpscfg-dump.XXXXXX\") || exit 4\nr=$(mktemp \"$d/.vpscfg-dump.XXXXXX\") || { rm -f \"$t\"; exit 4; }\ntrap 'rm -f \"$t\" \"$r\"' EXIT\ndocker exec -e PGDATABASE='shop' 'pg-main' sh -c 'if [ -n \"${POSTGRES_PASSWORD_FILE:-}\" ] && [ -r \"$POSTGRES_PASSWORD_FILE\" ]; then PGPASSWORD=$(cat \"$POSTGRES_PASSWORD_FILE\"); else PGPASSWORD=\"${POSTGRES_PASSWORD:-${POSTGRESQL_PASSWORD:-}}\"; fi; export PGPASSWORD; exec pg_dump -Fc --no-password -U \"${POSTGRES_USER:-${POSTGRESQL_USERNAME:-postgres}}\"' > \"$t\" || { echo \"vpscfg: pg_dump failed\" >&2; exit 4; }\ntest -s \"$t\" || { echo \"vpscfg: the dump is empty\" >&2; exit 5; }\ndocker exec -i 'pg-main' pg_restore --list < \"$t\" > /dev/null || { echo \"vpscfg: pg_restore --list cannot read the dump\" >&2; exit 6; }\nh=$(sha256sum < \"$t\" | cut -d \" \" -f 1)\ntest -n \"$h\" || { echo \"vpscfg: sha256sum failed\" >&2; exit 7; }\nprintf '%s  %s\\n' \"$h\" \"$f\" > \"$r\"\nchmod 0600 \"$t\" \"$r\"\nmv \"$r\" \"$f.sha256\" && mv \"$t\" \"$f\" || exit 8\necho \"vpscfg: dumped $(wc -c < \"$f\" | tr -d \" \") bytes to $f, sha256 $h\"",
+      "canonical": "vpscfg-action pg_dump@2 '{\"container\":\"pg-main\",\"db\":\"shop\",\"dest_dir\":\"/var/backups/db1\",\"label\":\"rel-1.5\",\"min_free_gb\":5}'",
+      "check": "sha256sum --check --status '/var/backups/db1'/'shop'-'rel-1.5'-d7261f5c.dump.sha256 >/dev/null 2>&1 && echo VPSCFG-DONE || echo VPSCFG-NEEDED",
+      "idempotent": true,
+      "params": {
+        "container": "pg-main",
+        "db": "shop",
+        "dest_dir": "/var/backups/db1",
+        "label": "rel-1.5",
+        "min_free_gb": 5
+      },
+      "tier": "mutation",
+      "timeout": 1800,
+      "verify": "sha256sum --check --status '/var/backups/db1'/'shop'-'rel-1.5'-d7261f5c.dump.sha256",
+      "verify_retry": null
+    }
+  ],
+  "version": 2
+}

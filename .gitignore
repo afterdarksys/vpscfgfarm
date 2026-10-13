@@ -10,11 +10,16 @@ journal/
 .omc/*
 !.omc/skills/
 
+# Cached host indexes (vpscfg index): generated observation, never committed.
+/index/
+
 # Encrypted credential escrow bundles — encrypted or not, secrets stay out of git.
 escrow/
 
 # queued vpsrun plays: one-off intent, never policy
 plays/*.yaml
+# queued vpsrun releases (plays in order): the same one-off intent
+releases/*.yaml
 
 # local run wrappers for queued plays and one-off releases: same one-off
 # intent as plays/*.yaml

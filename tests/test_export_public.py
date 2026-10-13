@@ -144,6 +144,120 @@ class ScannerUnit(unittest.TestCase):
                 xp.load_allowlist(f.name)
 
 
+class IdentityMasking(unittest.TestCase):
+    """--identity: exact public-identity strings masked before the denylist
+    check. `examplecorp` stands in for a denylisted org name."""
+    ID_TERMS = ["examplecorp"]
+    MODULE = "github.com/examplecorp/tool"
+    LABEL = "com.examplecorp.tool"
+
+    def identity(self, body, terms=None):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write(body)
+        self.addCleanup(os.unlink, f.name)
+        return xp.load_identity(f.name, self.ID_TERMS if terms is None else terms)
+
+    def denylist_lines(self, text, path="f.go", body=None):
+        regex, _ = self.identity(body or "%s\n%s\n" % (self.MODULE, self.LABEL))
+        return [n for n, k, _, _ in xp.scan_text(path, text, self.ID_TERMS, regex)
+                if k == "denylist"]
+
+    def test_module_path_and_launchd_label_pass(self):
+        for text in ('import "github.com/examplecorp/tool/internal/x"',
+                     "go install github.com/examplecorp/tool/cmd/tool@latest",
+                     "module github.com/examplecorp/tool",
+                     "https://github.com/examplecorp/tool.git",
+                     "<string>com.examplecorp.tool</string>",
+                     'const label = "com.examplecorp.tool.daemon"',
+                     "GitHub.com/ExampleCorp/Tool/x"):  # folded the same way as text
+            with self.subTest(text=text):
+                self.assertEqual(self.denylist_lines(text), [])
+        self.assertEqual(self.denylist_lines("x", path="launchd/com.examplecorp.tool.plist"), [])
+
+    def test_hostnames_bare_term_and_neighbours_still_hit(self):
+        for text in ("apps.examplecorp.com", "examplecorp", "Examplecorp LLC",
+                     "github.com/examplecorp.com", "github.com/examplecorp/../secret",
+                     "github.com/examplecorp/other", "github.com/examplecorp/tools",
+                     "github.com/examplecorp/tool_x", "github.com/examplecorp/tool-x",
+                     "xgithub.com/examplecorp/tool", "evil.github.com/examplecorp/tool",
+                     "-github.com/examplecorp/tool", "_com.examplecorp.tool",
+                     "github.com/examplecorp/tool.examplecorp.com",
+                     "github.com/examplecorp/tool examplecorp",
+                     "examplecorp github.com/examplecorp/tool",
+                     "apps.examplecorp.com/github.com/examplecorp/tool",
+                     "com.examplecorp.tool.examplecorp.com",
+                     "com.examplecorp.toolbox"):
+            with self.subTest(text=text):
+                self.assertEqual(self.denylist_lines(text), [1])
+        self.assertEqual(self.denylist_lines("x", path="hosts/apps.examplecorp.com"), [0])
+
+    def test_unicode_and_zero_width_hostnames_still_hit(self):
+        for text in ("apps.example\u200bcorp.com", "apps.EXAMPLE\u2060CORP.com",
+                     "apps.\uff45\uff58\uff41\uff4d\uff50\uff4c\uff45corp.com",
+                     "apps.exa\u00admplecorp.com", "github.com/example\ufeffcorp.com"):
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(self.denylist_lines(text), [1])
+
+    def test_placeholder_keeps_neighbours_apart(self):
+        """The mask is a NUL, not an empty string: text on either side of an
+        entry is never glued into a term."""
+        regex, _ = self.identity("%s\n" % self.MODULE)
+        seen = set()
+        self.assertEqual(xp.mask_identity("ab/github.com/examplecorp/tool/cd", regex, seen),
+                         "ab/\0/cd")
+        self.assertEqual(seen, {self.MODULE})
+        # Term `corp=/x`: deleting the entry would glue `corp=` and `/x`.
+        terms = ["examplecorp", "corp=/x"]
+        regex, _ = self.identity("%s\n" % self.MODULE, terms)
+        hits = xp.scan_text("f", "corp=github.com/examplecorp/tool/x", terms, regex)
+        self.assertEqual(hits, [])
+
+    def test_other_scan_kinds_are_not_masked(self):
+        regex, _ = self.identity("examplecorp.tool.io\n")
+        mail = "ops" "@examplecorp.tool.io"
+        kinds = [k for _, k, _, _ in xp.scan_text("f", "mail %s" % mail, self.ID_TERMS, regex)]
+        self.assertIn("email", kinds)
+        self.assertNotIn("denylist", kinds)
+        token = "ghp_" + "a1B2" * 9
+        kinds = [k for _, k, _, _ in xp.scan_text(
+            "f", "%s %s" % (self.MODULE, token), self.ID_TERMS, regex)]
+        self.assertIn("github-token", kinds)
+
+    def test_binary_bytes_are_never_masked(self):
+        regex, _ = self.identity("%s\n" % self.MODULE)
+        hits = xp.scan_binary("tool.bin", ("\x00%s\x00" % self.MODULE).encode(),
+                              self.ID_TERMS, regex)
+        self.assertEqual([k for _, k, _, _ in hits], ["binary-denylist"])
+
+    def test_bad_entries_are_refused(self):
+        for body, why in (("examplecorp\n", "shorter than 12"),
+                          ("corp.example.io\n", "contains no denylist term"),
+                          ("github.com/other/tool\n", "contains no denylist term"),
+                          ("x.examplecorp\u200b\n", "printable ASCII"),
+                          ("github.com/examplecorp tool\n", "printable ASCII"),
+                          ("github.com/examplecorp\ttool\n", "printable ASCII"),
+                          ("\uff47ithub.com/examplecorp\n", "printable ASCII"),
+                          ("# only a comment\n", "lists no entries")):
+            with self.subTest(body=ascii(body)), self.assertRaises(xp.Refused) as cm:
+                self.identity(body)
+            self.assertIn(why, str(cm.exception))
+
+    def test_short_entry_is_refused(self):
+        _, entries = self.identity("x.examplecor\n", terms=["examplecor"])  # 12: the floor
+        self.assertEqual(entries, ["x.examplecor"])
+        for body in ("my.example\n", "x.examplec\n", "abc.example\n"):
+            with self.subTest(body=body), self.assertRaises(xp.Refused) as cm:
+                self.identity(body, terms=["example"])
+            self.assertIn("shorter than 12", str(cm.exception))
+
+    def test_bare_term_entry_is_refused(self):
+        terms = ["examplecorp", "vault.examplecorp.io"]
+        for body in ("vault.examplecorp.io\n", "VAULT.ExampleCorp.IO\n"):
+            with self.subTest(body=body), self.assertRaises(xp.Refused) as cm:
+                self.identity(body, terms=terms)
+            self.assertIn("bare denylist term", str(cm.exception))
+
+
 class ExportEndToEnd(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -414,6 +528,69 @@ class ExportEndToEnd(unittest.TestCase):
         r = self.export(commit=first)
         self.assertEqual(r.returncode, 1)  # the first commit's estate file leaks
         self.assertIn("estate/hosts.txt:1:ipv4:", r.stdout)
+
+    # --- --identity: public-identity masks ----------------------------------
+
+    def identity_setup(self, body, go_mod="module github.com/examplecorp/tool\n"):
+        self.deny.write_text("\n".join(TERMS + ["examplecorp"]) + "\n")
+        self.write("tool/go.mod", go_mod)
+        self.write("tool/main.go", 'package main\n\nimport "github.com/examplecorp/tool/internal/x"\n'
+                   '\nconst label = "com.examplecorp.tool.daemon"\n')
+        self.commit("module path")
+        return self.listfile("identity.txt", body)
+
+    def test_identity_lets_the_module_path_through_and_is_printed(self):
+        ident = self.identity_setup("# public names\ngithub.com/examplecorp/tool\n"
+                                    "com.examplecorp.tool.daemon  # launchd\n")
+        r = self.export("--identity", str(ident))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("identity: 2 entries from %s" % ident, r.stderr)
+        self.assertIn("  github.com/examplecorp/tool\n", r.stderr)
+        self.assertIn("  com.examplecorp.tool.daemon\n", r.stderr)
+        self.assertIn("0 stale identity entries", r.stderr)
+        self.assertEqual(self.git(self.out, "rev-list", "--all", "--count").strip(), "1")
+
+    def test_without_identity_the_module_path_blocks(self):
+        self.identity_setup("github.com/examplecorp/tool\n")
+        r = self.export()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("tool/go.mod:1:denylist:", r.stdout)
+        self.assertNotIn("identity:", r.stderr)
+
+    def test_identity_does_not_hide_a_hostname_next_to_it(self):
+        ident = self.identity_setup(
+            "github.com/examplecorp/tool\ncom.examplecorp.tool.daemon\n",
+            go_mod="module github.com/examplecorp/tool // mirror apps.examplecorp.com\n")
+        r = self.export("--identity", str(ident))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("tool/go.mod:1:denylist:", r.stdout)
+        self.assertFalse((self.out / ".git").exists())
+
+    def test_stale_identity_entry_blocks(self):
+        ident = self.identity_setup("github.com/examplecorp/tool\ncom.examplecorp.tool.daemon\n"
+                                    "github.com/examplecorp/retired\n")
+        r = self.export("--identity", str(ident))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("github.com/examplecorp/retired: stale-identity", r.stdout)
+        self.assertIn("1 stale identity entry", r.stderr)
+        self.assertIn("NOT COMMITTED", r.stderr)
+        self.assertFalse((self.out / ".git").exists())
+
+    def test_refused_identity_file_exits_2_before_exporting(self):
+        ident = self.identity_setup("github.com/examplecorp/tool\n")
+        for body, why in (("examplecorp\n", "shorter than 12"),
+                          ("corp.example.io\n", "contains no denylist term"),
+                          ("examplecor.p\n", "contains no denylist term"),
+                          ("x.examplecorp \u200b\n", "printable ASCII")):
+            with self.subTest(body=ascii(body)):
+                ident.write_text(body)
+                r = self.export("--identity", str(ident))
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(why, r.stderr)
+                self.assertFalse(self.out.exists())
+        r = self.export("--identity", str(self.lists / "missing.txt"))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertFalse(self.out.exists())
 
     def test_no_commit_mode_never_inits(self):
         r = self.export("--no-commit")

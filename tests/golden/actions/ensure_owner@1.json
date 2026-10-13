@@ -1,0 +1,28 @@
+{
+  "action": "ensure_owner",
+  "expansions": [
+    {
+      "assumes": [
+        {
+          "container": "pg-main",
+          "host": "web1"
+        }
+      ],
+      "body": "docker exec -i -e PGDATABASE='shop' 'pg-main' sh -c 'if [ -n \"${POSTGRES_PASSWORD_FILE:-}\" ] && [ -r \"$POSTGRES_PASSWORD_FILE\" ]; then PGPASSWORD=$(cat \"$POSTGRES_PASSWORD_FILE\"); else PGPASSWORD=\"${POSTGRES_PASSWORD:-${POSTGRESQL_PASSWORD:-}}\"; fi; export PGPASSWORD; exec psql -X -q -tA -F \"\t\" -v ON_ERROR_STOP=1 -U \"${POSTGRES_USER:-${POSTGRESQL_USERNAME:-postgres}}\" -f -' <<'VPSCFG_SQL'\nBEGIN;\nSET LOCAL lock_timeout = '10s';\nSELECT 'pending ' || k || ' ' || count(*) FROM (SELECT CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'matview' WHEN 'S' THEN 'sequence' ELSE 'table' END AS k FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sales' AND c.relkind IN ('r', 'p', 'v', 'm', 'S') AND pg_get_userbyid(c.relowner) <> 'app_owner') s GROUP BY k ORDER BY k;\nSELECT 'pending schema 1' FROM pg_namespace WHERE nspname = 'sales' AND pg_get_userbyid(nspowner) <> 'app_owner';\nDO $vpscfg$\nDECLARE r record;\nBEGIN\n  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_owner') THEN\n    RAISE EXCEPTION 'vpscfg: the role does not exist';\n  END IF;\n  IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'sales') THEN\n    RAISE EXCEPTION 'vpscfg: the schema does not exist';\n  END IF;\n  IF (SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'sales') <> 'app_owner' THEN\n    EXECUTE format('ALTER SCHEMA %I OWNER TO %I', 'sales', 'app_owner');\n  END IF;\n  FOR r IN SELECT c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sales' AND c.relkind IN ('r', 'p', 'v', 'm') AND pg_get_userbyid(c.relowner) <> 'app_owner' ORDER BY c.relkind, c.relname LOOP\n    EXECUTE format('ALTER %s %I.%I OWNER TO %I', CASE r.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END, 'sales', r.relname, 'app_owner');\n  END LOOP;\n  FOR r IN SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sales' AND c.relkind IN ('S') AND pg_get_userbyid(c.relowner) <> 'app_owner' ORDER BY c.relname LOOP\n    EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO %I', 'sales', r.relname, 'app_owner');\n  END LOOP;\n  IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sales' AND c.relkind IN ('r', 'p', 'v', 'm', 'S') AND pg_get_userbyid(c.relowner) <> 'app_owner') THEN\n    RAISE EXCEPTION 'vpscfg: objects are still not owned; rolled back';\n  END IF;\nEND\n$vpscfg$;\nSELECT 'owned ' || count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sales' AND c.relkind IN ('r', 'p', 'v', 'm', 'S');\nCOMMIT;\nVPSCFG_SQL",
+      "canonical": "vpscfg-action ensure_owner@1 '{\"container\":\"pg-main\",\"db\":\"shop\",\"role\":\"app_owner\",\"schema\":\"sales\"}'",
+      "check": "docker exec -i -e PGDATABASE=shop -e PGOPTIONS='-c default_transaction_read_only=on' pg-main sh -c 'if [ -n \"${POSTGRES_PASSWORD_FILE:-}\" ] && [ -r \"$POSTGRES_PASSWORD_FILE\" ]; then PGPASSWORD=$(cat \"$POSTGRES_PASSWORD_FILE\"); else PGPASSWORD=\"${POSTGRES_PASSWORD:-${POSTGRESQL_PASSWORD:-}}\"; fi; export PGPASSWORD; exec psql -X -q -tA -F \"\t\" -v ON_ERROR_STOP=1 -U \"${POSTGRES_USER:-${POSTGRESQL_USERNAME:-postgres}}\" -f -' <<'SQL'\nBEGIN READ ONLY;\nSET statement_timeout = '10s';\nSELECT '@@@check';\nSELECT CASE WHEN EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'sales' AND pg_get_userbyid(nspowner) = 'app_owner') AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sales' AND c.relkind IN ('r', 'p', 'v', 'm', 'S') AND pg_get_userbyid(c.relowner) <> 'app_owner') THEN 'VPSCFG-DONE' ELSE 'VPSCFG-NEEDED' END;\nCOMMIT;\nSQL",
+      "idempotent": true,
+      "params": {
+        "container": "pg-main",
+        "db": "shop",
+        "role": "app_owner",
+        "schema": "sales"
+      },
+      "tier": "mutation",
+      "timeout": 300,
+      "verify": "docker exec -i -e PGDATABASE=shop -e PGOPTIONS='-c default_transaction_read_only=on' pg-main sh -c 'if [ -n \"${POSTGRES_PASSWORD_FILE:-}\" ] && [ -r \"$POSTGRES_PASSWORD_FILE\" ]; then PGPASSWORD=$(cat \"$POSTGRES_PASSWORD_FILE\"); else PGPASSWORD=\"${POSTGRES_PASSWORD:-${POSTGRESQL_PASSWORD:-}}\"; fi; export PGPASSWORD; exec psql -X -q -tA -F \"\t\" -v ON_ERROR_STOP=1 -U \"${POSTGRES_USER:-${POSTGRESQL_USERNAME:-postgres}}\" -f -' <<'SQL'\nBEGIN READ ONLY;\nSET statement_timeout = '10s';\nSELECT '@@@check';\nSELECT CASE WHEN EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'sales' AND pg_get_userbyid(nspowner) = 'app_owner') AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sales' AND c.relkind IN ('r', 'p', 'v', 'm', 'S') AND pg_get_userbyid(c.relowner) <> 'app_owner') THEN 'VPSCFG-DONE' ELSE 'VPSCFG-NEEDED' END;\nCOMMIT;\nSQL",
+      "verify_retry": null
+    }
+  ],
+  "version": 1
+}

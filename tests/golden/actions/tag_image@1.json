@@ -1,0 +1,36 @@
+{
+  "action": "tag_image",
+  "expansions": [
+    {
+      "assumes": [],
+      "body": "docker image tag 'shop/web:1.5' 'shop/web:rollback'",
+      "canonical": "vpscfg-action tag_image@1 '{\"image_ref\":\"shop/web:1.5\",\"new_tag\":\"shop/web:rollback\"}'",
+      "check": "docker inspect --format '{{range .RepoTags}}{{println .}}{{end}}' 'shop/web:1.5' | grep -qxF 'shop/web:rollback' && echo VPSCFG-DONE || echo VPSCFG-NEEDED",
+      "idempotent": true,
+      "params": {
+        "image_ref": "shop/web:1.5",
+        "new_tag": "shop/web:rollback"
+      },
+      "tier": "mutation",
+      "timeout": 60,
+      "verify": "docker inspect --format '{{range .RepoTags}}{{println .}}{{end}}' 'shop/web:1.5' | grep -qxF 'shop/web:rollback'",
+      "verify_retry": null
+    },
+    {
+      "assumes": [],
+      "body": "docker image tag 'registry.example.com:5000/shop/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 'registry.example.com:5000/shop/web:1.5'",
+      "canonical": "vpscfg-action tag_image@1 '{\"image_ref\":\"registry.example.com:5000/shop/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"new_tag\":\"registry.example.com:5000/shop/web:1.5\"}'",
+      "check": "docker inspect --format '{{range .RepoTags}}{{println .}}{{end}}' 'registry.example.com:5000/shop/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' | grep -qxF 'registry.example.com:5000/shop/web:1.5' && echo VPSCFG-DONE || echo VPSCFG-NEEDED",
+      "idempotent": true,
+      "params": {
+        "image_ref": "registry.example.com:5000/shop/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "new_tag": "registry.example.com:5000/shop/web:1.5"
+      },
+      "tier": "mutation",
+      "timeout": 60,
+      "verify": "docker inspect --format '{{range .RepoTags}}{{println .}}{{end}}' 'registry.example.com:5000/shop/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' | grep -qxF 'registry.example.com:5000/shop/web:1.5'",
+      "verify_retry": null
+    }
+  ],
+  "version": 1
+}

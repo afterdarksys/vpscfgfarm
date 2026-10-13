@@ -33,7 +33,7 @@ DENY_ALWAYS_FLOOR = [
 READ_ONLY_VERBS = frozenset(
     ["show", "details", "containers", "services", "overlays",
      "drift", "verify", "fleet", "plan", "status", "help", "lint", "journal", "ports",
-     "backup-verify", "map", "logs", "sql"]
+     "backup-verify", "map", "logs", "sql", "index"]
 )
 
 

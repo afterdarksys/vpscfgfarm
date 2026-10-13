@@ -1,0 +1,122 @@
+{
+  "action": "migrate",
+  "expansions": [
+    {
+      "assumes": [
+        {
+          "container": "shop-api",
+          "env_names_any_of": [
+            [
+              "DATABASE_URL"
+            ],
+            [
+              "DB_HOST",
+              "DB_NAME",
+              "DB_USER",
+              "DB_PASS"
+            ]
+          ],
+          "host": "web1"
+        }
+      ],
+      "body": "docker exec -w '/app' 'shop-api' ./node_modules/.bin/prisma migrate deploy",
+      "canonical": "vpscfg-action migrate@1 '{\"container\":\"shop-api\",\"runner\":\"prisma_deploy\",\"workdir\":\"/app\"}'",
+      "check": null,
+      "idempotent": false,
+      "params": {
+        "container": "shop-api",
+        "runner": "prisma_deploy",
+        "workdir": "/app"
+      },
+      "tier": "mutation",
+      "timeout": 600,
+      "verify": null,
+      "verify_retry": null
+    },
+    {
+      "assumes": [
+        {
+          "container": "shop-api",
+          "env_names_any_of": [
+            [
+              "DATABASE_URL"
+            ],
+            [
+              "DB_HOST",
+              "DB_NAME",
+              "DB_USER",
+              "DB_PASS"
+            ]
+          ],
+          "host": "web1"
+        }
+      ],
+      "body": "docker exec 'shop-api' alembic upgrade head",
+      "canonical": "vpscfg-action migrate@1 '{\"container\":\"shop-api\",\"runner\":\"alembic_upgrade_head\"}'",
+      "check": null,
+      "idempotent": false,
+      "params": {
+        "container": "shop-api",
+        "runner": "alembic_upgrade_head"
+      },
+      "tier": "mutation",
+      "timeout": 600,
+      "verify": null,
+      "verify_retry": null
+    },
+    {
+      "assumes": [
+        {
+          "container": "shop-api",
+          "env_names_any_of": [
+            [
+              "DATABASE_URL"
+            ],
+            [
+              "DB_HOST",
+              "DB_NAME",
+              "DB_USER",
+              "DB_PASS"
+            ]
+          ],
+          "host": "web1"
+        }
+      ],
+      "body": "docker exec 'shop-api' ./node_modules/.bin/node-pg-migrate up",
+      "canonical": "vpscfg-action migrate@1 '{\"container\":\"shop-api\",\"runner\":\"node_pg_migrate_up\"}'",
+      "check": null,
+      "idempotent": false,
+      "params": {
+        "container": "shop-api",
+        "runner": "node_pg_migrate_up"
+      },
+      "tier": "mutation",
+      "timeout": 600,
+      "verify": null,
+      "verify_retry": null
+    },
+    {
+      "assumes": [
+        {
+          "container": "pg-main",
+          "host": "web1"
+        }
+      ],
+      "body": "docker exec -w '/migrations' -e PGDATABASE='shop' 'pg-main' sh -c 'if [ -n \"${POSTGRES_PASSWORD_FILE:-}\" ] && [ -r \"$POSTGRES_PASSWORD_FILE\" ]; then PGPASSWORD=$(cat \"$POSTGRES_PASSWORD_FILE\"); else PGPASSWORD=\"${POSTGRES_PASSWORD:-${POSTGRESQL_PASSWORD:-}}\"; fi; export PGPASSWORD; LC_ALL=C; export LC_ALL; set -e; n=0; for f in ./*.sql; do test -e \"$f\" || { echo \"vpscfg: no .sql files\" >&2; exit 2; }; psql -X -q -v ON_ERROR_STOP=1 -U \"${POSTGRES_USER:-${POSTGRESQL_USERNAME:-postgres}}\" -1 -f \"$f\"; n=$((n+1)); done; echo \"vpscfg: applied $n file(s)\"'",
+      "canonical": "vpscfg-action migrate@1 '{\"container\":\"pg-main\",\"db\":\"shop\",\"runner\":\"sql_dir\",\"workdir\":\"/migrations\"}'",
+      "check": null,
+      "idempotent": false,
+      "params": {
+        "container": "pg-main",
+        "db": "shop",
+        "runner": "sql_dir",
+        "workdir": "/migrations"
+      },
+      "tier": "mutation",
+      "timeout": 600,
+      "verify": null,
+      "verify_retry": null
+    }
+  ],
+  "version": 1
+}

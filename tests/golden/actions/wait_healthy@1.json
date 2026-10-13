@@ -1,0 +1,49 @@
+{
+  "action": "wait_healthy",
+  "expansions": [
+    {
+      "assumes": [
+        {
+          "container": "shop-web",
+          "host": "web1"
+        }
+      ],
+      "body": "docker inspect --format '{{.State.Health.Status}}' 'shop-web' | grep -qx healthy",
+      "canonical": "vpscfg-action wait_healthy@1 '{\"container\":\"shop-web\",\"interval\":3,\"tries\":20}'",
+      "check": null,
+      "idempotent": false,
+      "params": {
+        "container": "shop-web",
+        "interval": 3,
+        "tries": 20
+      },
+      "tier": "read",
+      "timeout": null,
+      "verify": null,
+      "verify_retry": [
+        20,
+        3
+      ]
+    },
+    {
+      "assumes": [],
+      "body": "curl -qfsS --max-time 5 'http://127.0.0.1:8080/healthz'",
+      "canonical": "vpscfg-action wait_healthy@1 '{\"interval\":3,\"tries\":10,\"url\":\"http://127.0.0.1:8080/healthz\"}'",
+      "check": null,
+      "idempotent": false,
+      "params": {
+        "interval": 3,
+        "tries": 10,
+        "url": "http://127.0.0.1:8080/healthz"
+      },
+      "tier": "read",
+      "timeout": null,
+      "verify": null,
+      "verify_retry": [
+        10,
+        3
+      ]
+    }
+  ],
+  "version": 1
+}
