@@ -33,6 +33,9 @@ OPERATOR = "alice"
 
 
 def _local(host, cmd, timeout=None):
+    # The fixture host runs no systemd, whatever the test machine boots (as
+    # tests/test_detach_reconcile.py's _local).
+    cmd = cmd.replace("/run/systemd/system", "/nonexistent/vpscfg-fixture-has-no-systemd")
     r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
                        timeout=timeout or 60)
     return r.returncode, r.stdout, r.stderr
@@ -494,13 +497,18 @@ class ExporterScanTest(unittest.TestCase):
     itself leak them, so this file names none either). This runs the REAL
     scan_text() from tools/export-public.py with a FICTIONAL term list, first
     proving the scan bites on a planted line, then over the files this
-    workstream touched (adversarial item 12). With VPSCFG_PUBLIC_DENYLIST set
-    to the path of the real list, a second test scans the same files with it
-    (skipped when unset, as in CI)."""
+    workstream touched (adversarial item 12).
+
+    The scan with the REAL list is not a unit test: the list can never exist
+    where this suite runs publicly, and a test that skips without it is a skip
+    the CI gate (rightly) refuses. It runs where the list does, at publish:
+    tools/export-public.py refuses an empty --denylist and scans every exported
+    path and byte with it — this file and every file in FILES included (all
+    are allowlisted) — and commits nothing on a hit."""
 
     DENYLIST = ["examplecorp-estate", "web1.examplecorp.net", "shop-prod.example.net"]
     # Every file phase 2 (typed actions, P0-P4) added or changed. This file is
-    # scanned only by the real-denylist test: it names the fictional terms.
+    # denylist-scanned only by the exporter at publish: it names the fictional terms.
     FILES = (
         "docs/ACTIONS.md", "docs/INDEX.md", "docs/README.md", "docs/RECOVERY.md",
         "docs/VPSEXEC.md", "plays/README.md", "tools/public-allowlist.txt", "vpsrun",
@@ -553,18 +561,6 @@ class ExporterScanTest(unittest.TestCase):
             path = REPO / rel
             hits = self.exporter.scan_text(rel, path.read_text(), [])
             self.assertEqual(hits, [], "exporter hit in %s: %r" % (rel, hits))
-
-    def test_the_real_denylist_when_given(self):
-        path = os.environ.get("VPSCFG_PUBLIC_DENYLIST")
-        if not path:
-            self.skipTest("VPSCFG_PUBLIC_DENYLIST is not set (the estate list is not in "
-                          "this repo)")
-        terms = self.exporter.load_terms(path)
-        self.assertTrue(terms, "the denylist at VPSCFG_PUBLIC_DENYLIST is empty")
-        for rel in self.FILES + (self.SELF,):
-            hits = self._denylist_hits(REPO / rel, terms)
-            # Never print the matched term: it is the thing being kept private.
-            self.assertEqual(len(hits), 0, "%d denylist hit(s) in %s" % (len(hits), rel))
 
 
 if __name__ == "__main__":

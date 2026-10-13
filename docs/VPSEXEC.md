@@ -121,7 +121,9 @@ session ending (`vpscfg/detach.py`). Its files live in
 `/run/vpscfg-ops/<operation id>/` (0700 root): `<i>.sh` (the gated command),
 `<i>.out`, `<i>.err`, `<i>.rc`, `<i>.unit`/`<i>.pid` (the runner),
 `<i>.cpid` (the step, = its process-group id) and `<i>.cstart` (that leader's
-start time: Linux `/proc/<pid>/stat` field 22, else `ps -o lstart=`). The
+start time: Linux `/proc/<pid>/stat` field 22, else `ps -o lstart=`, written by
+the leader itself before it execs the step, so a step that exits at once
+cannot lose it). The
 launcher is `systemd-run --unit vpscfg-<op16>-<i> --collect -p KillMode=mixed`.
 The step runs in the session's working directory with its HOME and PATH,
 under bash when present.
@@ -197,8 +199,8 @@ remaining process of the unit — including anything the step left running.
   (its ends close with it). Under systemd the unit carries
   `RuntimeMaxSec=<step timeout + 60s>`; the runner passes the TERM on to the
   step's whole group.
-- After the step exits, its log readers get **LOG_GRACE = 5 s** to reach end of
-  file; then `<i>.rc` is written regardless. A reader still running then is
+- After the step exits, its log readers get **LOG_GRACE = 5 s** (wall clock; at most
+  6 s, as `date +%s` counts whole seconds) to reach end of file; then `<i>.rc` is written regardless. A reader still running then is
   held open by a process the step left in its group: that process makes the
   operation STILL RUNNING to reconcile (below), and its output keeps reaching
   the log up to the cap.

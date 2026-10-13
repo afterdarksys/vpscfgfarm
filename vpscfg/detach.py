@@ -168,6 +168,16 @@ _PG_FN = (_START_FN + "; pgstate() { pg=none; g=; test -s \"$1.cpid\" || return 
           " | grep -q '^Z'; then now=$(st \"$g\"); was=$(cat \"$1.cstart\" 2>/dev/null);"
           " if test -n \"$was\" && test \"$now\" = \"$was\"; then pg=alive; else pg=reused; fi;"
           " elif kill -s 0 -- -\"$g\" 2>/dev/null; then pg=leaderless; else pg=gone; fi; }")
+# How the step is started inside its own process group: the group leader
+# records its OWN start time in <i>.cstart, then execs the step (same pid, same
+# start time). Recorded by the leader, it cannot be lost to a step that exits
+# before anyone else could read it. A failed write still runs the step (cstart
+# empty: a leaderless group is then never proven, so never signalled).
+def _leader(cstart):
+    return ("sh -c " + shlex.quote(
+        _START_FN + "; { printf '%s\\n' \"$(st $$)\" > \"$1.tmp\""
+        " && mv \"$1.tmp\" \"$1\"; } 2>/dev/null; shift; exec \"$@\"")
+        + " vpscfg-step-leader " + shlex.quote(cstart))
 # After the step exits, its log readers get at most this long to reach EOF
 # before the exit code is written. A reader still running then is held open
 # by a process the step left behind (it is in the step's process group, so
@@ -205,7 +215,6 @@ def _runner(d, i):
             "mkdir %(p)s.started 2>/dev/null || exit 75\n"
             "echo $$ > %(p)s.pid\n"
             "cd \"${VPSCFG_CWD:-/}\" 2>/dev/null || cd /\n"
-            "%(startfn)s\n"
             "fin() { printf '%%s\\n' \"$1\" > %(p)s.rc.tmp && mv %(p)s.rc.tmp %(p)s.rc; }\n"
             "rm -f %(p)s.ofifo %(p)s.efifo\n"
             "mkfifo %(p)s.ofifo %(p)s.efifo || { fin %(nofifo)d; exit %(nofifo)d; }\n"
@@ -238,10 +247,10 @@ def _runner(d, i):
             # Every process of the step inherits its tag (VPSCFG_OP=<op>.<i>):
             # how `reconcile --stop` tells the step's members from a reused group.
             "if command -v setsid >/dev/null 2>&1; then\n"
-            " %(tag)s setsid $x %(p)s.sh >%(p)s.ofifo 2>%(p)s.efifo </dev/null 7>&- 8>&- & c=$!\n"
+            " %(tag)s setsid %(lead)s $x %(p)s.sh >%(p)s.ofifo 2>%(p)s.efifo </dev/null 7>&- 8>&- & c=$!\n"
             "elif command -v perl >/dev/null 2>&1; then\n"
             " %(tag)s perl -e 'setpgrp(0, 0) or exit %(noiso)d; exec @ARGV or exit %(noiso)d'"
-            " $x %(p)s.sh >%(p)s.ofifo 2>%(p)s.efifo </dev/null 7>&- 8>&- & c=$!\n"
+            " %(lead)s $x %(p)s.sh >%(p)s.ofifo 2>%(p)s.efifo </dev/null 7>&- 8>&- & c=$!\n"
             "else\n"
             " echo 'vpscfg: this host has neither setsid nor perl: the step cannot run"
             " in its own process group, so nothing could stop all of it; not started' >&8;"
@@ -256,9 +265,12 @@ def _runner(d, i):
             " if test $k -ge 100; then kill -KILL \"$c\" 2>/dev/null; echo 'vpscfg: step not"
             " isolated in its own process group; killed' > %(p)s.iso; break; fi;"
             " sleep 0.05; done\n"
-            # The leader's start time: a later live pid with this number and
-            # another start time is a reused pid, never signalled as the step.
-            "printf '%%s\\n' \"$(st \"$c\")\" > %(p)s.cstart\n"
+            # The leader's start time (<i>.cstart) is written by the leader
+            # itself (_leader, before it execs the step), never read here: a
+            # step that exits at once (`sleep 30 & exit 0`) was already reaped
+            # — dash and bash reap any child while running a foreground
+            # command — so its /proc entry was gone, cstart was empty, and the
+            # child it left could never be proven the step's or stopped.
             "exec 7>&- 8>&-\n"
             "test -n \"$t\" && { t=; kill -s TERM -- -\"$c\" 2>/dev/null; }\n"
             # Poll instead of a blocking `wait`: dash runs a trap only after
@@ -270,12 +282,21 @@ def _runner(d, i):
             " test -n \"$t\" && { t=; kill -s TERM -- -\"$c\" 2>/dev/null; }; sleep 0.2; done\n"
             "wait \"$c\"; r=$?\n"
             "test -s %(p)s.iso && r=%(noiso)d\n"
-            "n=0; while [ $n -lt %(grace10)d ] && { kill -0 $o 2>/dev/null || kill -0 $e 2>/dev/null; };"
-            " do sleep 0.1; n=$((n+1)); done\n"
+            # Wall-clock, not an iteration count: each pass forks `sleep`, and
+            # on a loaded host 50 passes of `sleep 0.1` took far longer than
+            # LOG_GRACE. `date +%%s` has 1 s resolution, so the bound is +1:
+            # the readers get at least LOG_GRACE and at most LOG_GRACE + 1.
+            # Never a command substitution inside $((...)): bash 5.2 running
+            # the TERM trap while it parses one loses the parse and exits 1
+            # (no rc). A clock that is not a number ends the grace at once.
+            "n=$(date +%%s); case $n in ''|*[!0-9]*) n=0;; esac; n=$((n + %(grace)d + 1));"
+            " while { kill -0 $o 2>/dev/null || kill -0 $e 2>/dev/null; }"
+            " && [ \"$(date +%%s)\" -lt \"$n\" ]; do sleep 0.1; done\n"
             "rm -f %(p)s.ofifo %(p)s.efifo\n"
             "fin \"$r\"\n"
-            % {"p": p, "reader": q(_READER % {"cap": LOG_CAP}), "grace10": LOG_GRACE * 10,
-               "nofifo": RC_NO_FIFO, "noiso": RC_NO_ISOLATION, "startfn": _START_FN,
+            % {"p": p, "reader": q(_READER % {"cap": LOG_CAP}), "grace": LOG_GRACE,
+               "lead": _leader(p + ".cstart"),
+               "nofifo": RC_NO_FIFO, "noiso": RC_NO_ISOLATION,
                "tag": "%s=%s" % (STEP_TAG, q("%s.%d" % (d.rstrip("/").rsplit("/", 1)[-1], i)))})
 
 

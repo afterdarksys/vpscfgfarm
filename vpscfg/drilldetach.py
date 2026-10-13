@@ -474,8 +474,19 @@ def _scenario_reconcile_running_then_completed(host, guard, runner, scratch, ope
 
     runner(host, "touch %s" % shlex.quote(marker))
 
-    rc = _vpsexec.reconcile([host], guard, _EMPTY_VPSEXEC_POLICY, ssh=runner,
-                            stream=stream, prompt=counting_prompt)
+    # The child polls for the marker every 0.1 s, so it ends a moment AFTER
+    # the touch; a reconcile in that moment rightly still says STILL RUNNING
+    # (and refuses before any prompt). Wait for it to settle, bounded.
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            rc = _vpsexec.reconcile([host], guard, _EMPTY_VPSEXEC_POLICY, ssh=runner,
+                                    stream=stream, prompt=counting_prompt)
+            break
+        except Refused as r:
+            if "STILL RUNNING" not in str(r) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
     phrase_prompts = [m for m in seen_prompts if "RECONCILE:" in m]
     ok = (still_running_seen and prompts_before_release == 0 and rc == 0
           and len(phrase_prompts) == 1)

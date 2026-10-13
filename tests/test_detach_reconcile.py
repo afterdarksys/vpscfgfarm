@@ -29,6 +29,11 @@ HOST = "fixture"
 
 
 def _local(host, cmd, timeout=None, connect_timeout=None):
+    # The fixture "host" runs no systemd — a fact of the fixture, never of the
+    # machine running the tests (a CI runner or a Linux workstation boots
+    # systemd). The launch asks `test -d /run/systemd/system`; point it at a
+    # path that cannot exist. Tests of the systemd branch fake their own host.
+    cmd = cmd.replace("/run/systemd/system", "/nonexistent/vpscfg-fixture-has-no-systemd")
     r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
                        timeout=timeout or 60)
     return r.returncode, r.stdout, r.stderr
@@ -100,6 +105,14 @@ class _Base(unittest.TestCase):
          detach._sleep, detach._clock, vpsexec.sshconfig.load, vpsexec.sshconfig.machines,
          vpsexecgrant._is_controlling_tty, vpsexecgrant.flush_input) = self.saved
         time.sleep(0.3)
+        # A detached runner may still be writing its files (a test that gave
+        # up on a fake clock does not wait for it); on a loaded host 0.3 s is
+        # not enough and rmtree races it. Wait, bounded, until no process
+        # names the fixture directory any more.
+        end = time.time() + 15
+        while time.time() < end and subprocess.run(
+                ["pgrep", "-f", self.tmp.name], capture_output=True).returncode == 0:
+            time.sleep(0.1)
         self.tmp.cleanup()
 
     def events(self, name=None):

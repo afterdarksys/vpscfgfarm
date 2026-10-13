@@ -1061,6 +1061,12 @@ class StopTest(_Reconcile):  # M2
         self.assertIsInstance(res, Refused)
         self.assertIn("STILL RUNNING", str(res))
         self.assertTrue(Path(lock.LOCK_DIR, "token").exists())
+        # On Linux the leader's recorded start time lets the members prove
+        # they are the step's (test_step_leaves_background_child_then_stop);
+        # without it nothing can. Drop it, so this is the unprovable group on
+        # every platform. (Before the leader recorded its own start time, a
+        # fast-exiting step always lost it — which is what this test saw.)
+        Path(detach.op_dir(token), "1.cstart").write_text("\n")
         self.prompts.clear()
         res, _ = self.reconcile("--stop")
         self.assertIsInstance(res, Refused)
@@ -1422,6 +1428,24 @@ class RunnerTest(unittest.TestCase):
     def test_the_leaders_start_time_is_recorded(self):
         rc, _, _, d = self.run_step(self.SHELLS[0], "sleep 1")
         self.assertTrue(Path(d, "1.cstart").read_text().strip())
+
+    def test_a_step_that_exits_at_once_still_records_its_start_time(self):
+        """The runner used to read the leader's start time after the leader
+        had already exited and been reaped: cstart was empty, and the child
+        the step left could never be proven the step's (ubuntu CI, StopTest)."""
+        for sh in self.SHELLS:
+            with self.subTest(shell=sh):
+                n = "44.%06d" % (int(time.time() * 1e6) % 1000000)
+                self.addCleanup(subprocess.run, ["pkill", "-f", "sleep %s" % n],
+                                capture_output=True)
+                _, _, _, d = self.run_step(sh, "sleep %s >/dev/null 2>&1 & exit 0" % n)
+                self.assertTrue(Path(d, "1.cstart").read_text().strip())
+
+    def test_no_command_substitution_inside_arithmetic(self):
+        """bash 5.2 running the TERM trap while it parses `$(($(cmd) ...))`
+        exits 1 with no rc (test_a_term_storm_still_ends_with_an_exit_code,
+        ~3% of runs on a loaded Linux host)."""
+        self.assertNotIn("$(($(", detach._runner("/run/vpscfg-ops/" + "a" * 16, 1))
 
     def start_runner(self, shell, d):
         """Start <d>/1.run in a new session, as systemd/setsid would. Its
