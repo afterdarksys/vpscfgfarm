@@ -76,11 +76,11 @@ done
 "$py" -I -c 'import sys; sys.exit(0 if sys.flags.isolated else 1)' 2>/dev/null \
     || refuse "$py does not run isolated under -I (is it a Python 3 interpreter?)"
 
-for door in vpsexec vpscfg-control.py vpsrun; do
+for door in vpsexec vpscfg-control.py vpsrun cfgfarm; do
     f="$root/$door"
     [ -f "$f" ] && [ ! -L "$f" ] || refuse "$f is missing or a symlink"
 done
-for door in vpsexec vpscfg-control.py vpsrun; do
+for door in vpsexec vpscfg-control.py vpsrun cfgfarm; do
     f="$root/$door"
     tmp="$(mktemp "${TMPDIR:-/tmp}/pin-interpreter.XXXXXX")"
     { printf '%s\n' "$line"; tail -n +2 "$f"; } > "$tmp"

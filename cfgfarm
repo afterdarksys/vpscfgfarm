@@ -1,0 +1,15 @@
+#!/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I
+"""Pinned, isolated dispatcher; all remote work goes through existing doors."""
+import os
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parent
+exe = os.path.realpath(sys.executable)
+if sys.platform == 'darwin' and os.path.dirname(exe) == '/usr/bin':
+    sys.exit('REFUSED: pin a real interpreter with tools/pin-interpreter.sh')
+if not sys.flags.isolated:
+    os.execv(exe, [exe, '-I', sys.argv[0]] + sys.argv[1:])
+sys.path.insert(0, str(root))
+from vpscfg.farmcli import main
+sys.exit(main(sys.argv[1:], Path(sys.argv[0]).name, root, exe))

@@ -384,9 +384,9 @@ class PinInterpreter(unittest.TestCase):
         os.chmod(str(self.base), 0o755)
         self.root = self.base / "tool"
         self.root.mkdir()
-        for door in DOORS:
+        for door in DOORS + ("cfgfarm",):
             shutil.copy2(str(REPO / door), str(self.root / door))
-        self.before = {d: (self.root / d).read_bytes() for d in DOORS}
+        self.before = {d: (self.root / d).read_bytes() for d in DOORS + ("cfgfarm",)}
 
     def pin(self, target, *extra):
         return subprocess.run([str(PIN), "--root", str(self.root)] + list(extra) + [str(target)],
@@ -396,7 +396,7 @@ class PinInterpreter(unittest.TestCase):
         r = self.pin(target)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn(needle, r.stderr)
-        for d in DOORS:  # nothing written
+        for d in DOORS + ("cfgfarm",):  # nothing written
             self.assertEqual((self.root / d).read_bytes(), self.before[d], d)
 
     def binary_copy(self, mode=0o755, where=None):
@@ -408,10 +408,10 @@ class PinInterpreter(unittest.TestCase):
         os.chmod(str(dest), mode)
         return dest
 
-    def test_pins_all_three_doors_in_place(self):
+    def test_pins_all_doors_and_dispatcher_in_place(self):
         r = self.pin(REAL_PYTHON)
         self.assertEqual(r.returncode, 0, r.stderr)
-        for d in DOORS:
+        for d in DOORS + ("cfgfarm",):
             lines = (self.root / d).read_text().split("\n", 1)
             self.assertEqual(lines[0], "#!%s -I" % REAL_PYTHON)
             self.assertEqual(lines[1], self.before[d].decode().split("\n", 1)[1])

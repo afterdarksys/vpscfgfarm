@@ -103,7 +103,7 @@ point it at yours, using the interpreter that has PyYAML:
 tools/pin-interpreter.sh "$(python3 -c 'import os,sys;print(os.path.realpath(sys.executable))')"
 ```
 
-It rewrites line 1 of `vpscfg-control.py`, `vpsexec` and `vpsrun`. It refuses,
+It rewrites line 1 of `vpscfg-control.py`, `vpsexec`, `vpsrun` and `cfgfarm`. It refuses,
 writing nothing, unless the target is an absolute, real (not symlinked),
 executable binary that is not group- or world-writable, in a directory that is
 not either, that actually reports isolation under `-I`, and that on macOS is
@@ -114,6 +114,51 @@ Start the doors **by path** (`./vpsexec`, or a symlink such as
 `~/bin/vpsexec`). The `python3 vpsexec` form cannot be protected against a
 hostile startup hook in the first interpreter; wrappers and agent harnesses
 should deny it.
+
+### Unified entrypoints and hardware tooling
+
+`cfgfarm host`, `cfgfarm vps`, and `cfgfarm cloud` share the existing
+contracted-deploy interface. The executable aliases `hostcfgfarm`,
+`vpscfgfarm`, and `cloudcfgfarm` are equivalent to those prefixes. Cloud
+currently uses the SSH estate and contracts; it does not provision cloud
+provider resources. `tools/pin-interpreter.sh` also pins `cfgfarm`; keep the
+three aliases as symlinks to it.
+
+```sh
+./cfgfarm vps status
+./vpscfgfarm status
+./cfgfarm cloud exec web1 'uptime'
+./hostcfgfarm ipmi lab1 status
+./hostcfgfarm idrac lab1 status
+./hostcfgfarm esxi hypervisor1 list
+./hostcfgfarm esxi hypervisor1 status 42
+./hostcfgfarm fusion mac1 list
+./hostcfgfarm fusion mac1 start '/VMs/example.vmwarevm/example.vmx' --reason 'start lab VM'
+./hostcfgfarm pxe lab1 once --reason 'prepare lab network boot'
+./hostcfgfarm ipxe script https://boot.example.com/boot.ipxe
+```
+
+Run `./cfgfarm --help` for all actions. Backend commands execute **on the
+selected governed SSH host**, using installed `ipmitool`, Dell `racadm`,
+ESXi `vim-cmd`, or Fusion `vmrun` (on that host's trusted PATH). IPMI uses
+the local system interface; RACADM uses local access on a supported host or
+the controller's SSH command environment. Remote BMC credentials and arbitrary
+vendor options are deliberately not accepted by these adapters. Govern the
+actual machine affected by each command; these adapters are not a shared
+BMC jump-host inventory system.
+
+All backend actions retain the existing governor, posture, policy, journal,
+reason, `--run`, and exact-plan approval gates. Vendor observations currently
+also require mutation-tier authorization because their tools are outside the
+read allowlist. Review the plan, then repeat with `--run` and approval as
+explained in [docs/VPSEXEC.md](docs/VPSEXEC.md). Missing tools fail through the
+normal per-host result path. Fusion stop/reset/suspend request soft actions.
+
+PXE `once` and `efi-once` select a one-time network boot, without powering or
+rebooting the machine. iPXE `script` emits a DHCP/HTTPS chain script locally;
+it does not deploy DHCP/TFTP services or publish boot images. Save the draft
+and publish using the existing governed `vpsexec push` workflow. Review boot
+payloads before arranging a network boot.
 
 ### 2. Point the tool at an estate
 

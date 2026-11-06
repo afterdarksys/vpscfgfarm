@@ -1,0 +1,12 @@
+Implemented baseline tooling:
+    [x] IPMI power, sensor and boot-device commands through vpsexec
+    [x] iDRAC RACADM power commands through vpsexec
+    [x] PXE one-time BIOS/EFI boot selection and iPXE HTTPS script drafts
+    [x] ESXi VM inventory, state and power commands
+    [x] VMware Fusion vmrun inventory and soft lifecycle commands
+    [x] cfgfarm host/vps/cloud and equivalent executable aliases
+
+Future extensions:
+    - Governed remote BMC endpoint inventory and credential references
+    - DHCP/TFTP service and boot-image lifecycle management
+    - Cloud provider provisioning adapters (cloud currently uses SSH contracts)
